@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import * as cheerio from "cheerio";
 import JSZip from "jszip";
@@ -17,9 +18,64 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// In-memory job state
+// In-memory + /tmp file-backed job state (resilient across serverless lambda restarts)
 const jobs = new Map<string, ExtractionJob>();
 const imageBuffers = new Map<string, Buffer>(); // key: `${jobId}_${productId}_${imageId}`
+
+function saveJob(jobOrId: string | ExtractionJob, maybeJob?: ExtractionJob) {
+  const job = typeof jobOrId === "string" ? maybeJob! : jobOrId;
+  if (!job) return;
+  jobs.set(job.jobId, job);
+  try {
+    const tmpDir = path.join("/tmp", "extractor_jobs");
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, `${job.jobId}.json`), JSON.stringify(job));
+  } catch (err) {
+    // Ignore filesystem write errors if /tmp is read-only
+  }
+}
+
+function getJob(jobId: string): ExtractionJob | undefined {
+  if (jobs.has(jobId)) return jobs.get(jobId);
+  try {
+    const filePath = path.join("/tmp", "extractor_jobs", `${jobId}.json`);
+    if (fs.existsSync(filePath)) {
+      const data = fs.readFileSync(filePath, "utf-8");
+      const job = JSON.parse(data) as ExtractionJob;
+      saveJob(jobId, job);
+      return job;
+    }
+  } catch (err) {
+    // Ignore read error
+  }
+  return undefined;
+}
+
+function saveImageBuffer(key: string, buffer: Buffer) {
+  imageBuffers.set(key, buffer);
+  try {
+    const tmpDir = path.join("/tmp", "extractor_images");
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, `${key}.bin`), buffer);
+  } catch (err) {
+    // Ignore write error
+  }
+}
+
+function getImageBuffer(key: string): Buffer | undefined {
+  if (imageBuffers.has(key)) return imageBuffers.get(key);
+  try {
+    const filePath = path.join("/tmp", "extractor_images", `${key}.bin`);
+    if (fs.existsSync(filePath)) {
+      const buf = fs.readFileSync(filePath);
+      imageBuffers.set(key, buf);
+      return buf;
+    }
+  } catch (err) {
+    // Ignore read error
+  }
+  return undefined;
+}
 
 // Cleanup older jobs to prevent memory growth (older than 30 minutes)
 setInterval(() => {
@@ -332,28 +388,46 @@ app.post("/api/extract", async (req, res) => {
     failedDownloads: [],
   };
 
-  jobs.set(jobId, job);
+  saveJob(job);
 
-  // Run the crawler asynchronously in the background
-  runCrawler(jobId).catch((err) => {
-    console.error(`Error in crawler for job ${jobId}:`, err);
-    const j = jobs.get(jobId);
-    if (j) {
-      j.status = "failed";
-      j.error = err.message || "An unknown extraction error occurred.";
+  if (process.env.VERCEL) {
+    // On Vercel serverless functions, execution is frozen after sending response.
+    // We await crawler completion so extraction finishes before lambda terminates.
+    try {
+      await runCrawler(jobId);
+    } catch (err: any) {
+      console.error(`Error in crawler for job ${jobId}:`, err);
+      const j = getJob(jobId);
+      if (j) {
+        j.status = "failed";
+        j.error = err.message || "An unknown extraction error occurred.";
+        saveJob(j);
+      }
     }
-  });
+    const finalJob = getJob(jobId) || job;
+    return res.json({ jobId, job: finalJob });
+  } else {
+    // Run the crawler asynchronously in the background for standard Node containers
+    runCrawler(jobId).catch((err) => {
+      console.error(`Error in crawler for job ${jobId}:`, err);
+      const j = getJob(jobId);
+      if (j) {
+        j.status = "failed";
+        j.error = err.message || "An unknown extraction error occurred.";
+        saveJob(j);
+      }
+    });
 
-  res.json({ jobId });
+    return res.json({ jobId });
+  }
 });
 
 // API: Get extraction job status
 app.get("/api/jobs/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const job = getJob(req.params.jobId);
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
   }
-  // Return a copy but without the actual buffer data (as that would be huge, although we store buffers separately)
   res.json(job);
 });
 
@@ -361,14 +435,14 @@ app.get("/api/jobs/:jobId", (req, res) => {
 app.get("/api/jobs/:jobId/products/:productId/images/:imageId", (req, res) => {
   const { jobId, productId, imageId } = req.params;
   const bufferKey = `${jobId}_${productId}_${imageId}`;
-  const buffer = imageBuffers.get(bufferKey);
+  const buffer = getImageBuffer(bufferKey);
 
   if (!buffer) {
     return res.status(404).send("Image not found");
   }
 
   // Find image metadata to set correct content-type
-  const job = jobs.get(jobId);
+  const job = getJob(jobId);
   const product = job?.products.find(p => p.id === productId);
   const imageMeta = product?.images.find(i => i.id === imageId);
 
@@ -381,13 +455,13 @@ app.get("/api/jobs/:jobId/products/:productId/images/:imageId", (req, res) => {
 app.get("/api/jobs/:jobId/download-image/:productId/:imageId", (req, res) => {
   const { jobId, productId, imageId } = req.params;
   const bufferKey = `${jobId}_${productId}_${imageId}`;
-  const buffer = imageBuffers.get(bufferKey);
+  const buffer = getImageBuffer(bufferKey);
 
   if (!buffer) {
     return res.status(404).send("Image not found");
   }
 
-  const job = jobs.get(jobId);
+  const job = getJob(jobId);
   const product = job?.products.find(p => p.id === productId);
   const imageMeta = product?.images.find(i => i.id === imageId);
 
@@ -403,7 +477,7 @@ app.get("/api/jobs/:jobId/download-image/:productId/:imageId", (req, res) => {
 // API: Generate and Download ZIP of the entire job
 app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
   const { jobId } = req.params;
-  const job = jobs.get(jobId);
+  const job = getJob(jobId);
 
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
@@ -433,7 +507,7 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
       for (const img of product.images) {
         if (img.downloadStatus === "Downloaded") {
           const bufferKey = `${jobId}_${product.id}_${img.id}`;
-          const buffer = imageBuffers.get(bufferKey);
+          const buffer = getImageBuffer(bufferKey);
 
           if (buffer) {
             // If color-specific or option variant subfolders are requested
@@ -485,7 +559,7 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
 
 // THE CRAWLING SCRAPER ENGINE
 async function runCrawler(jobId: string) {
-  const job = jobs.get(jobId);
+  const job = getJob(jobId);
   if (!job) return;
 
   const urlStr = job.url.trim();
@@ -501,7 +575,7 @@ async function runCrawler(jobId: string) {
     try {
       const totalUrls = job.urls.length;
       job.progress.productsFound = totalUrls;
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
 
       for (let uIdx = 0; uIdx < totalUrls; uIdx++) {
         const currentUrl = job.urls[uIdx].trim();
@@ -509,7 +583,7 @@ async function runCrawler(jobId: string) {
         job.progress.currentProductName = currentUrl;
         job.progress.currentStep = `Analyzing link ${uIdx + 1} of ${totalUrls}...`;
         job.progress.percent = Math.floor(10 + (uIdx / totalUrls) * 85);
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         let platform = "generic";
         let html = "";
@@ -559,7 +633,7 @@ async function runCrawler(jobId: string) {
         }
 
         job.progress.currentStep = `Extracting link ${uIdx + 1}/${totalUrls} (${platform.toUpperCase()})...`;
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         if (detectedMode === "collection") {
           let colProductUrls: { url: string; name?: string }[] = [];
@@ -678,12 +752,12 @@ async function runCrawler(jobId: string) {
       job.status = "completed";
       job.progress.currentStep = "All links from file parsed and extracted successfully!";
       job.progress.percent = 100;
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
     } catch (bulkErr: any) {
       console.error("Bulk extraction general error:", bulkErr);
       job.status = "failed";
       job.error = bulkErr.message || "A general error occurred during bulk file extraction.";
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
     }
     return;
   }
@@ -692,7 +766,7 @@ async function runCrawler(jobId: string) {
     // 1. Fetch main page HTML
     job.progress.currentStep = "Fetching website HTML...";
     job.progress.percent = 10;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
 
     const HEADERS = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -748,14 +822,14 @@ async function runCrawler(jobId: string) {
 
     job.progress.currentStep = `Detected platform: ${platform.toUpperCase()}. Mode: ${detectedMode === "product" ? "Single Product Page" : "Product Listing / Collection"}`;
     job.progress.percent = 20;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
 
     let productUrls: { url: string; name?: string }[] = [];
 
     // --- COLLECTION WORKFLOW ---
     if (detectedMode === "collection") {
       job.progress.currentStep = "Searching for product cards...";
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
 
       if (platform === "shopify") {
         // Shopify collection JSON extraction trick is incredibly clean!
@@ -888,7 +962,7 @@ async function runCrawler(jobId: string) {
 
       job.progress.currentStep = `Found ${productUrls.length} products to process.`;
       job.progress.percent = 25;
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
 
       // Extract products sequentially
       for (let index = 0; index < productUrls.length; index++) {
@@ -896,7 +970,7 @@ async function runCrawler(jobId: string) {
         job.progress.currentProductIndex = index + 1;
         job.progress.currentProductName = pObj.name || `Product ${index + 1}`;
         job.progress.percent = Math.floor(25 + (index / productUrls.length) * 50);
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         try {
           const productData = await extractAndDownloadProduct(jobId, pObj.url, pObj.name, platform, job);
@@ -913,7 +987,7 @@ async function runCrawler(jobId: string) {
       // --- SINGLE PRODUCT WORKFLOW ---
       if (job.options.includeStyleSiblings) {
         job.progress.currentStep = "Scanning product page for sibling color swatches / style group...";
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         const siblingUrls = new Set<string>();
         siblingUrls.add(urlStr); // Always include the original page URL!
@@ -948,7 +1022,7 @@ async function runCrawler(jobId: string) {
         const urlsToProcess = Array.from(siblingUrls);
         job.progress.productsFound = urlsToProcess.length;
         job.progress.currentStep = `Found ${urlsToProcess.length} sibling style listings. Starting style collection scrape...`;
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         for (let index = 0; index < urlsToProcess.length; index++) {
           const sUrl = urlsToProcess[index];
@@ -963,7 +1037,7 @@ async function runCrawler(jobId: string) {
 
           job.progress.currentProductName = guessedName;
           job.progress.percent = Math.floor(30 + (index / urlsToProcess.length) * 50);
-          jobs.set(jobId, job);
+          saveJob(jobId, job);
 
           try {
             const productData = await extractAndDownloadProduct(jobId, sUrl, undefined, platform, job);
@@ -981,7 +1055,7 @@ async function runCrawler(jobId: string) {
         job.progress.currentProductIndex = 1;
         job.progress.currentProductName = "Analyzing main product...";
         job.progress.percent = 30;
-        jobs.set(jobId, job);
+        saveJob(jobId, job);
 
         const productData = await extractAndDownloadProduct(jobId, urlStr, undefined, platform, job);
         if (productData) {
@@ -996,13 +1070,13 @@ async function runCrawler(jobId: string) {
     job.status = "completed";
     job.progress.currentStep = "Extraction successfully completed!";
     job.progress.percent = 100;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
 
   } catch (err: any) {
     console.error(`Crawler failed:`, err);
     job.status = "failed";
     job.error = err.message || "An error occurred during extraction.";
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
   }
 }
 
@@ -1287,7 +1361,7 @@ async function extractAndDownloadProduct(
   const uniqueUrls = new Set<string>();
 
   job.progress.currentStep = `Extracting images for: ${productTitle}`;
-  jobs.set(jobId, job);
+  saveJob(jobId, job);
 
   // Normalize URLs and deduplicate
   const normalizedCandidates: { url: string; originalUrl: string; variant?: string; type: string }[] = [];
@@ -1357,13 +1431,13 @@ async function extractAndDownloadProduct(
   }
 
   job.progress.imagesFound += normalizedCandidates.length;
-  jobs.set(jobId, job);
+  saveJob(jobId, job);
 
   // Download candidate images
   let imgIndex = 1;
   for (const cand of normalizedCandidates) {
     job.progress.currentStep = `Downloading image ${imgIndex} of ${normalizedCandidates.length} for ${productTitle}...`;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
 
     const imageId = `img-${Date.now()}-${imgIndex}`;
     const cleanProdName = sanitizeFilename(productTitle);
@@ -1394,8 +1468,8 @@ async function extractAndDownloadProduct(
       const resolution = dims ? `${dims.width} x ${dims.height}` : "1200 x 1200"; // realistic placeholder fallback
       const sizeStr = formatBytes(buffer.length);
 
-      // Save to memory storage
-      imageBuffers.set(`${jobId}_${productDataId}_${imageId}`, buffer);
+      // Save to memory and /tmp storage
+      saveImageBuffer(`${jobId}_${productDataId}_${imageId}`, buffer);
 
       finalImages.push({
         id: imageId,
@@ -1431,7 +1505,7 @@ async function extractAndDownloadProduct(
     }
 
     imgIndex++;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
   }
 
   // Deduplicate options
@@ -1453,7 +1527,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
   job.progress.currentStep = "Initiating Sandbox Crawler...";
   job.progress.percent = 10;
-  jobs.set(jobId, job);
+  saveJob(jobId, job);
   await sleep(600);
 
   // Unsplash high quality test images
@@ -1493,7 +1567,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
   const productsToProcess = isListing ? demoProducts : [demoProducts[0]];
   job.progress.productsFound = productsToProcess.length;
   job.progress.percent = 25;
-  jobs.set(jobId, job);
+  saveJob(jobId, job);
   await sleep(600);
 
   let productIdx = 1;
@@ -1501,7 +1575,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
     job.progress.currentProductIndex = productIdx;
     job.progress.currentProductName = dp.name;
     job.progress.currentStep = `Scanning product page for: ${dp.name}...`;
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
     await sleep(800);
 
     const productDataId = `prod-demo-${productIdx}-${Date.now()}`;
@@ -1511,7 +1585,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
     let imgIdx = 1;
     for (const imgSpec of dp.images) {
       job.progress.currentStep = `Downloading image ${imgIdx} of ${dp.images.length} for ${dp.name}...`;
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
 
       const imageId = `img-demo-${productIdx}-${imgIdx}`;
       const extension = ".jpg";
@@ -1525,7 +1599,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
         if (!res.ok) throw new Error("Fetch failed");
 
         const buffer = Buffer.from(await res.arrayBuffer());
-        imageBuffers.set(`${jobId}_${productDataId}_${imageId}`, buffer);
+        saveImageBuffer(`${jobId}_${productDataId}_${imageId}`, buffer);
 
         const dims = getImageDimensions(buffer);
         const resolution = dims ? `${dims.width} x ${dims.height}` : "1200 x 800";
@@ -1567,7 +1641,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
       job.progress.imagesFound++;
       imgIdx++;
-      jobs.set(jobId, job);
+      saveJob(jobId, job);
       await sleep(300);
     }
 
@@ -1581,19 +1655,30 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
     productIdx++;
     job.progress.percent = Math.floor(25 + ((productIdx - 1) / productsToProcess.length) * 70);
-    jobs.set(jobId, job);
+    saveJob(jobId, job);
   }
 
   // Set as completed
   job.status = "completed";
   job.progress.percent = 100;
   job.progress.currentStep = "Sandbox extraction complete. All buffers successfully validated and stored!";
-  jobs.set(jobId, job);
+  saveJob(jobId, job);
 }
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// Global Express error handler to ensure API errors always respond with JSON
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("Unhandled Express route error:", err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  res.status(err.status || 500).json({
+    error: err.message || "An internal server error occurred."
+  });
+});
 
 // SETUP VITE DEVELOPMENT MIDDLEWARE OR SERVE PRODUCTION BUNDLE
 async function startServer() {

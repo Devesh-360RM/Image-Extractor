@@ -32,6 +32,23 @@ import {
 } from "lucide-react";
 import { ExtractionJob, ProductData, ImageMetadata } from "./types";
 
+async function safeParseJsonResponse<T = any>(res: Response): Promise<T> {
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || `Server error (${res.status})`);
+    }
+    return data;
+  }
+  
+  const text = await res.text();
+  const cleanText = text.replace(/<[^>]*>?/gm, " ").replace(/\s+/g, " ").trim();
+  const summary = cleanText.length > 200 ? cleanText.substring(0, 200) + "..." : cleanText;
+  
+  throw new Error(summary || `Request failed with status ${res.status}`);
+}
+
 export default function App() {
   // Input State
   const [url, setUrl] = useState("");
@@ -88,10 +105,7 @@ export default function App() {
     pollIntervalRef.current = setInterval(async () => {
       try {
         const res = await fetch(`/api/jobs/${jobId}`);
-        if (!res.ok) {
-          throw new Error("Failed to fetch job details");
-        }
-        const data: ExtractionJob = await res.json();
+        const data: ExtractionJob = await safeParseJsonResponse(res);
         setJob(data);
 
         if (data.status === "completed") {
@@ -106,7 +120,7 @@ export default function App() {
         }
       } catch (err: any) {
         console.error("Polling error:", err);
-        setError("Error communicating with the extraction service.");
+        setError(err.message || "Error communicating with the extraction service.");
         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       }
     }, 800);
@@ -142,37 +156,40 @@ export default function App() {
         })
       });
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to initialize extraction.");
-      }
-
-      const { jobId } = await res.json();
+      const responseData = await safeParseJsonResponse<{ jobId: string; job?: ExtractionJob }>(res);
+      const jobId = responseData.jobId;
       setActiveJobId(jobId);
       
-      // Initialize local layout progress state
-      setJob({
-        jobId,
-        url,
-        mode,
-        status: "analyzing",
-        options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
-        progress: {
-          currentStep: "Contacting remote server...",
-          productsFound: 0,
-          currentProductIndex: 0,
-          currentProductName: "",
-          imagesFound: 0,
-          imagesDownloaded: 0,
-          imagesFailed: 0,
-          duplicatesRemoved: 0,
-          percent: 5,
-        },
-        products: [],
-        failedDownloads: [],
-      });
+      if (responseData.job) {
+        setJob(responseData.job);
+        if (responseData.job.status === "completed" && responseData.job.products?.length > 0) {
+          setExpandedProducts({ [responseData.job.products[0].id]: true });
+        }
+      } else {
+        // Initialize local layout progress state for asynchronous polling
+        setJob({
+          jobId,
+          url,
+          mode,
+          status: "analyzing",
+          options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
+          progress: {
+            currentStep: "Contacting remote server...",
+            productsFound: 0,
+            currentProductIndex: 0,
+            currentProductName: "",
+            imagesFound: 0,
+            imagesDownloaded: 0,
+            imagesFailed: 0,
+            duplicatesRemoved: 0,
+            percent: 5,
+          },
+          products: [],
+          failedDownloads: [],
+        });
 
-      startPolling(jobId);
+        startPolling(jobId);
+      }
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred. Please try again.");
     } finally {
@@ -198,12 +215,7 @@ export default function App() {
         body: formData,
       });
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to parse file");
-      }
-
-      const result = await res.json();
+      const result = await safeParseJsonResponse(res);
       setFileParsingState({
         isLoading: false,
         error: null,
@@ -273,37 +285,40 @@ export default function App() {
         })
       });
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to initialize extraction.");
-      }
-
-      const { jobId } = await res.json();
+      const responseData = await safeParseJsonResponse<{ jobId: string; job?: ExtractionJob }>(res);
+      const jobId = responseData.jobId;
       setActiveJobId(jobId);
       
-      // Initialize local layout progress state
-      setJob({
-        jobId,
-        url: selectedUrl.trim(),
-        mode: fileExtractionMode,
-        status: "analyzing",
-        options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
-        progress: {
-          currentStep: "Contacting remote server...",
-          productsFound: 0,
-          currentProductIndex: 0,
-          currentProductName: "",
-          imagesFound: 0,
-          imagesDownloaded: 0,
-          imagesFailed: 0,
-          duplicatesRemoved: 0,
-          percent: 5,
-        },
-        products: [],
-        failedDownloads: [],
-      });
+      if (responseData.job) {
+        setJob(responseData.job);
+        if (responseData.job.status === "completed" && responseData.job.products?.length > 0) {
+          setExpandedProducts({ [responseData.job.products[0].id]: true });
+        }
+      } else {
+        // Initialize local layout progress state
+        setJob({
+          jobId,
+          url: selectedUrl.trim(),
+          mode: fileExtractionMode,
+          status: "analyzing",
+          options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
+          progress: {
+            currentStep: "Contacting remote server...",
+            productsFound: 0,
+            currentProductIndex: 0,
+            currentProductName: "",
+            imagesFound: 0,
+            imagesDownloaded: 0,
+            imagesFailed: 0,
+            duplicatesRemoved: 0,
+            percent: 5,
+          },
+          products: [],
+          failedDownloads: [],
+        });
 
-      startPolling(jobId);
+        startPolling(jobId);
+      }
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred. Please try again.");
     } finally {
@@ -339,38 +354,41 @@ export default function App() {
         })
       });
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to initialize bulk extraction.");
-      }
-
-      const { jobId } = await res.json();
+      const responseData = await safeParseJsonResponse<{ jobId: string; job?: ExtractionJob }>(res);
+      const jobId = responseData.jobId;
       setActiveJobId(jobId);
       
-      // Initialize layout with bulk state
-      setJob({
-        jobId,
-        url: `Bulk Scrape: ${selectedUrls.length} links`,
-        urls: selectedUrls,
-        mode: fileExtractionMode,
-        status: "analyzing",
-        options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
-        progress: {
-          currentStep: "Contacting remote server...",
-          productsFound: selectedUrls.length,
-          currentProductIndex: 0,
-          currentProductName: "",
-          imagesFound: 0,
-          imagesDownloaded: 0,
-          imagesFailed: 0,
-          duplicatesRemoved: 0,
-          percent: 5,
-        },
-        products: [],
-        failedDownloads: [],
-      });
+      if (responseData.job) {
+        setJob(responseData.job);
+        if (responseData.job.status === "completed" && responseData.job.products?.length > 0) {
+          setExpandedProducts({ [responseData.job.products[0].id]: true });
+        }
+      } else {
+        // Initialize layout with bulk state
+        setJob({
+          jobId,
+          url: `Bulk Scrape: ${selectedUrls.length} links`,
+          urls: selectedUrls,
+          mode: fileExtractionMode,
+          status: "analyzing",
+          options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
+          progress: {
+            currentStep: "Contacting remote server...",
+            productsFound: selectedUrls.length,
+            currentProductIndex: 0,
+            currentProductName: "",
+            imagesFound: 0,
+            imagesDownloaded: 0,
+            imagesFailed: 0,
+            duplicatesRemoved: 0,
+            percent: 5,
+          },
+          products: [],
+          failedDownloads: [],
+        });
 
-      startPolling(jobId);
+        startPolling(jobId);
+      }
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred. Please try again.");
     } finally {
@@ -382,10 +400,8 @@ export default function App() {
     if (!activeJobId) return;
     try {
       const res = await fetch(`/api/jobs/${activeJobId}`);
-      if (res.ok) {
-        const data = await res.json();
-        setJob(data);
-      }
+      const data = await safeParseJsonResponse(res);
+      setJob(data);
     } catch (err) {
       console.error("Failed to refresh job", err);
     }
