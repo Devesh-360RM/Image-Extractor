@@ -455,11 +455,16 @@ export default function App() {
       <header className="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-slate-200">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-indigo-600 flex items-center justify-center text-white shadow-sm shadow-indigo-100">
-              <Download className="w-5 h-5 stroke-[2.5]" />
+            <div className="w-9 h-9 rounded-lg bg-slate-100/80 border border-slate-200/80 flex items-center justify-center overflow-hidden">
+              <img 
+                id="header-logo" 
+                src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
+                alt="" 
+                className="w-full h-full object-contain" 
+              />
             </div>
             <div>
-              <span className="font-extrabold text-base sm:text-lg tracking-tight bg-gradient-to-r from-slate-950 to-indigo-955 bg-clip-text text-transparent">
+              <span className="font-extrabold text-base sm:text-lg tracking-tight text-slate-900">
                 360 RM : E-Commerce Image Extractor
               </span>
             </div>
@@ -479,16 +484,6 @@ export default function App() {
 
       <main className="max-w-4xl mx-auto px-4 pt-10">
         
-        {/* SUBTITLE HERO */}
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-extrabold tracking-tight text-slate-950 mb-3">
-            360 RM : E-Commerce Image Extractor
-          </h1>
-          <p className="text-slate-600 text-base max-w-xl mx-auto leading-relaxed">
-            Automatically find, catalog, and download original high-resolution product images, variants, and metadata from any online retail store.
-          </p>
-        </div>
-
         {/* DEMO PLAYGROUND ANNOUNCEMENT */}
         {showDemoBanner && !job && (
           <div className="mb-6 bg-indigo-50/50 border border-indigo-100 rounded-xl p-4 flex items-start gap-3.5 relative overflow-hidden">
