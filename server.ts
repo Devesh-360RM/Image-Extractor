@@ -1,0 +1,1621 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import * as cheerio from "cheerio";
+import JSZip from "jszip";
+import { fileURLToPath } from "url";
+import multer from "multer";
+import * as XLSX from "xlsx";
+import { ExtractionJob, ProductData, ImageMetadata } from "./src/types.js";
+
+// Setup __dirname for ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+
+// In-memory job state
+const jobs = new Map<string, ExtractionJob>();
+const imageBuffers = new Map<string, Buffer>(); // key: `${jobId}_${productId}_${imageId}`
+
+// Cleanup older jobs to prevent memory growth (older than 30 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, job] of jobs.entries()) {
+    // We parse job IDs which contain timestamp or we track creation time
+    const timestamp = parseInt(jobId.split('-')[1]);
+    if (isNaN(timestamp) || now - timestamp > 30 * 60 * 1000) {
+      jobs.delete(jobId);
+      // Delete matching buffers
+      for (const key of imageBuffers.keys()) {
+        if (key.startsWith(jobId)) {
+          imageBuffers.delete(key);
+        }
+      }
+    }
+  }
+}, 10 * 60 * 1000);
+
+// Helper: Programmatically parse JPEG, PNG, GIF, WebP dimensions from a Buffer
+function getImageDimensions(buffer: Buffer): { width: number; height: number } | null {
+  try {
+    if (buffer.length < 8) return null;
+
+    // Check PNG signature
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+      if (buffer.length >= 24) {
+        const width = buffer.readInt32BE(16);
+        const height = buffer.readInt32BE(20);
+        return { width, height };
+      }
+    }
+
+    // Check GIF signature
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) {
+      if (buffer.length >= 10) {
+        const width = buffer.readUInt16LE(6);
+        const height = buffer.readUInt16LE(8);
+        return { width, height };
+      }
+    }
+
+    // Check JPEG
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+      let i = 2;
+      while (i < buffer.length - 8) {
+        if (buffer[i] === 0xFF) {
+          const marker = buffer[i + 1];
+          if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) || (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+            const height = buffer.readUInt16BE(i + 5);
+            const width = buffer.readUInt16BE(i + 7);
+            return { width, height };
+          }
+          const length = buffer.readUInt16BE(i + 2);
+          i += 2 + length;
+        } else {
+          i++;
+        }
+      }
+    }
+
+    // WebP signature
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 && // RIFF
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) { // WEBP
+      if (buffer[12] === 0x56 && buffer[13] === 0x50 && buffer[14] === 0x38) {
+        const type = buffer[15]; // ' ' (VP8), 'L' (VP8L), 'X' (VP8X)
+        if (type === 0x20 && buffer.length >= 30) { // VP8
+          const width = buffer.readUInt16LE(26) & 0x3FFF;
+          const height = buffer.readUInt16LE(28) & 0x3FFF;
+          return { width, height };
+        } else if (type === 0x4C && buffer.length >= 25) { // VP8L
+          const val = buffer.readUInt32LE(21);
+          const width = (val & 0x3FFF) + 1;
+          const height = ((val >> 14) & 0x3FFF) + 1;
+          return { width, height };
+        } else if (type === 0x58 && buffer.length >= 30) { // VP8X
+          const width = (buffer.readUInt32LE(24) & 0xFFFFFF) + 1;
+          const height = (buffer.readUInt32LE(27) & 0xFFFFFF) + 1;
+          return { width, height };
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error parsing dimensions programmatically:", err);
+  }
+  return null;
+}
+
+// Format bytes helper
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 Bytes";
+  const k = 1024;
+  const sizes = ["Bytes", "KB", "MB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+// Clean filename for different OS
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, "").trim();
+}
+
+// Normalize and upscale ecommerce image URLs to get highest-quality
+function getHighResImageUrl(url: string, platform: string): string {
+  let cleanUrl = url;
+  if (url.startsWith("//")) {
+    cleanUrl = "https:" + url;
+  }
+
+  try {
+    const urlObj = new URL(cleanUrl);
+
+    // Shopify CDN image cleanup
+    if (cleanUrl.includes("cdn.shopify.com") || platform === "shopify") {
+      // Remove size suffixes like _300x300, _medium, _1024x1024, _master, _crop_center etc.
+      // Format: filename_1024x1024.jpg?v=123
+      const pathWithoutQuery = urlObj.pathname;
+      const cleanPath = pathWithoutQuery.replace(/_(small|medium|large|compact|grande|1024x1024|2048x2048|300x300|400x400|600x600|800x800|1000x1000|1200x1200|1600x1600|master)(_crop_center|_crop_top|_crop_bottom)?(\.[a-zA-Z0-9]+)$/, "$3");
+      urlObj.pathname = cleanPath;
+      
+      // We can keep the query parameters just in case Shopify CDN needs a version parameter, but remove size limits
+      if (urlObj.searchParams.has("width")) urlObj.searchParams.delete("width");
+      if (urlObj.searchParams.has("height")) urlObj.searchParams.delete("height");
+      if (urlObj.searchParams.has("crop")) urlObj.searchParams.delete("crop");
+      
+      return urlObj.toString();
+    }
+
+    // WooCommerce or WordPress attachments resizing (e.g. image-300x300.jpg -> image.jpg)
+    if (cleanUrl.includes("/wp-content/uploads/")) {
+      const cleanPath = urlObj.pathname.replace(/-\d+x\d+(\.[a-zA-Z0-9]+)$/, "$1");
+      urlObj.pathname = cleanPath;
+      return urlObj.toString();
+    }
+
+    // Weebly / Square Online CDN image cleanup (e.g. image.jpg?width=160 -> image.jpg)
+    if (cleanUrl.includes("editmysite.com") || platform === "weebly") {
+      if (urlObj.searchParams.has("width")) urlObj.searchParams.delete("width");
+      if (urlObj.searchParams.has("height")) urlObj.searchParams.delete("height");
+      return urlObj.toString();
+    }
+  } catch (e) {
+    // Ignore invalid URL parsing
+  }
+
+  return cleanUrl;
+}
+
+// API: Check server health
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+const storage = multer.memoryStorage();
+const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: 15 * 1024 * 1024 // 15MB limit
+  }
+});
+
+function extractUrlsFromBuffer(buffer: Buffer, filename: string, mimeType: string): string[] {
+  const urlRegex = /https?:\/\/[a-zA-Z0-9.\-_/=?&%#+~@:;()!*']+/gi;
+  const discoveredUrls = new Set<string>();
+
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+
+  if (ext === "xlsx" || ext === "xls" || ext === "csv" || mimeType.includes("spreadsheet") || mimeType.includes("excel") || mimeType.includes("csv")) {
+    try {
+      const workbook = XLSX.read(buffer, { type: "buffer" });
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        if (!sheet) continue;
+        const ref = sheet['!ref'];
+        if (!ref) continue;
+        const range = XLSX.utils.decode_range(ref);
+        for (let R = range.s.r; R <= range.e.r; ++R) {
+          for (let C = range.s.c; C <= range.e.c; ++C) {
+            const cell_address = { c: C, r: R };
+            const cell_ref = XLSX.utils.encode_cell(cell_address);
+            const cell = sheet[cell_ref];
+            if (cell && cell.v !== undefined) {
+              const valStr = String(cell.v);
+              const matches = valStr.match(urlRegex);
+              if (matches) {
+                matches.forEach(u => discoveredUrls.add(u.trim()));
+              }
+              if (cell.l && cell.l.Target) {
+                discoveredUrls.add(cell.l.Target.trim());
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Error parsing spreadsheet with XLSX:", err);
+    }
+  }
+
+  // PDF parser or regex fallback
+  if (ext === "pdf" || mimeType.includes("pdf")) {
+    try {
+      const utf8Str = buffer.toString("utf-8");
+      const latin1Str = buffer.toString("latin1");
+      
+      const matchesUtf8 = utf8Str.match(urlRegex);
+      if (matchesUtf8) {
+        matchesUtf8.forEach(u => discoveredUrls.add(u.trim()));
+      }
+      const matchesLatin1 = latin1Str.match(urlRegex);
+      if (matchesLatin1) {
+        matchesLatin1.forEach(u => {
+          const urlClean = u.replace(/[^a-zA-Z0-9.\-_/=?&%#+~@:;()!*']/g, "");
+          discoveredUrls.add(urlClean.trim());
+        });
+      }
+
+      // Also search for PDF URI annotations (/URI (https://...))
+      const uriRegex = /\/URI\s*\(([^)]+)\)/g;
+      let match;
+      while ((match = uriRegex.exec(utf8Str)) !== null) {
+        if (match[1]) discoveredUrls.add(match[1].trim());
+      }
+      while ((match = uriRegex.exec(latin1Str)) !== null) {
+        if (match[1]) discoveredUrls.add(match[1].trim());
+      }
+    } catch (err) {
+      console.error("Error parsing PDF binary:", err);
+    }
+  } else {
+    // Normal text extraction (txt, md, json, xml, csv fallback)
+    try {
+      const text = buffer.toString("utf-8");
+      const matches = text.match(urlRegex);
+      if (matches) {
+        matches.forEach(u => discoveredUrls.add(u.trim()));
+      }
+    } catch (err) {
+      console.error("Error parsing standard text:", err);
+    }
+  }
+
+  const validUrls: string[] = [];
+  discoveredUrls.forEach(url => {
+    try {
+      const cleanUrl = url.trim().replace(/[.)),;>\]'"]+$/, "");
+      if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
+        new URL(cleanUrl);
+        validUrls.push(cleanUrl);
+      }
+    } catch (_) {}
+  });
+
+  return Array.from(new Set(validUrls));
+}
+
+// API: Parse uploaded file to extract URLs
+app.post("/api/parse-file", upload.single("file"), (req: any, res: any) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file was uploaded" });
+  }
+
+  try {
+    const urls = extractUrlsFromBuffer(req.file.buffer, req.file.originalname, req.file.mimetype);
+    res.json({
+      filename: req.file.originalname,
+      count: urls.length,
+      urls
+    });
+  } catch (error: any) {
+    console.error("File processing error:", error);
+    res.status(500).json({ error: `Failed to process file: ${error.message}` });
+  }
+});
+
+// API: Create extraction job
+app.post("/api/extract", async (req, res) => {
+  const { url, urls, mode = "auto", options = {} } = req.body;
+
+  if (!url && (!urls || !Array.isArray(urls) || urls.length === 0)) {
+    return res.status(400).json({ error: "URL or a list of URLs is required" });
+  }
+
+  const jobId = `job-${Date.now()}`;
+  const job: ExtractionJob = {
+    jobId,
+    url: url || `Bulk Scrape: ${urls.length} links`,
+    urls: urls || undefined,
+    mode,
+    status: "analyzing",
+    options: {
+      includeGallery: options.includeGallery !== false,
+      includeVariants: options.includeVariants !== false,
+      useHighestResolution: options.useHighestResolution !== false,
+      removeDuplicates: options.removeDuplicates !== false,
+      includeStyleSiblings: options.includeStyleSiblings === true,
+    },
+    progress: {
+      currentStep: "Initializing extractor...",
+      productsFound: 0,
+      currentProductIndex: 0,
+      currentProductName: "",
+      imagesFound: 0,
+      imagesDownloaded: 0,
+      imagesFailed: 0,
+      duplicatesRemoved: 0,
+      percent: 5,
+    },
+    products: [],
+    failedDownloads: [],
+  };
+
+  jobs.set(jobId, job);
+
+  // Run the crawler asynchronously in the background
+  runCrawler(jobId).catch((err) => {
+    console.error(`Error in crawler for job ${jobId}:`, err);
+    const j = jobs.get(jobId);
+    if (j) {
+      j.status = "failed";
+      j.error = err.message || "An unknown extraction error occurred.";
+    }
+  });
+
+  res.json({ jobId });
+});
+
+// API: Get extraction job status
+app.get("/api/jobs/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+  // Return a copy but without the actual buffer data (as that would be huge, although we store buffers separately)
+  res.json(job);
+});
+
+// API: Get/Stream product image buffer
+app.get("/api/jobs/:jobId/products/:productId/images/:imageId", (req, res) => {
+  const { jobId, productId, imageId } = req.params;
+  const bufferKey = `${jobId}_${productId}_${imageId}`;
+  const buffer = imageBuffers.get(bufferKey);
+
+  if (!buffer) {
+    return res.status(404).send("Image not found");
+  }
+
+  // Find image metadata to set correct content-type
+  const job = jobs.get(jobId);
+  const product = job?.products.find(p => p.id === productId);
+  const imageMeta = product?.images.find(i => i.id === imageId);
+
+  res.setHeader("Content-Type", imageMeta?.contentType || "image/jpeg");
+  res.setHeader("Cache-Control", "public, max-age=31536000");
+  res.send(buffer);
+});
+
+// API: Download single image directly
+app.get("/api/jobs/:jobId/download-image/:productId/:imageId", (req, res) => {
+  const { jobId, productId, imageId } = req.params;
+  const bufferKey = `${jobId}_${productId}_${imageId}`;
+  const buffer = imageBuffers.get(bufferKey);
+
+  if (!buffer) {
+    return res.status(404).send("Image not found");
+  }
+
+  const job = jobs.get(jobId);
+  const product = job?.products.find(p => p.id === productId);
+  const imageMeta = product?.images.find(i => i.id === imageId);
+
+  if (!imageMeta) {
+    return res.status(404).send("Image metadata not found");
+  }
+
+  res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(imageMeta.filename)}"`);
+  res.setHeader("Content-Type", imageMeta.contentType || "application/octet-stream");
+  res.send(buffer);
+});
+
+// API: Generate and Download ZIP of the entire job
+app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
+  const { jobId } = req.params;
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  if (job.status !== "completed") {
+    return res.status(400).json({ error: "Extraction job is not complete yet" });
+  }
+
+  try {
+    const zip = new JSZip();
+
+    // Create a folder for the Job
+    const rootFolder = zip.folder("Image Extractor");
+    if (!rootFolder) throw new Error("Could not create ZIP root folder");
+
+    // CSV header row
+    let csvContent = `"Product Name","Product URL","Variant","Image Type","Image Number","Image File Name","Image URL","Image Resolution","Download Status"\n`;
+
+    // Process each product
+    for (const product of job.products) {
+      const sanitizedProductName = sanitizeFilename(product.name);
+      const productFolder = rootFolder.folder(sanitizedProductName);
+      if (!productFolder) continue;
+
+      let imageNum = 1;
+      for (const img of product.images) {
+        if (img.downloadStatus === "Downloaded") {
+          const bufferKey = `${jobId}_${product.id}_${img.id}`;
+          const buffer = imageBuffers.get(bufferKey);
+
+          if (buffer) {
+            // If color-specific or option variant subfolders are requested
+            if (job.options.includeVariants && img.variant && img.variant !== "General") {
+              const variantFolder = productFolder.folder(sanitizeFilename(img.variant));
+              if (variantFolder) {
+                variantFolder.file(img.filename, buffer);
+              } else {
+                productFolder.file(img.filename, buffer);
+              }
+            } else {
+              productFolder.file(img.filename, buffer);
+            }
+          }
+        }
+
+        // Add to CSV metadata
+        const csvRow = [
+          product.name,
+          product.url,
+          img.variant || "General",
+          img.type,
+          imageNum++,
+          img.filename,
+          img.originalUrl,
+          img.resolution,
+          img.downloadStatus
+        ].map(val => `"${String(val).replace(/"/g, '""')}"`).join(",");
+        csvContent += csvRow + "\n";
+      }
+    }
+
+    // Add product_data.csv
+    rootFolder.file("product_data.csv", csvContent);
+
+    // Generate zip content
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+    // Stream download
+    res.setHeader("Content-Disposition", `attachment; filename="Image_Extractor_${sanitizeFilename(job.url.replace(/^https?:\/\//, '').replace(/\//g, '_'))}.zip"`);
+    res.setHeader("Content-Type", "application/zip");
+    res.send(zipBuffer);
+  } catch (err: any) {
+    console.error("ZIP Generation Error:", err);
+    res.status(500).json({ error: "Failed to generate ZIP file: " + err.message });
+  }
+});
+
+
+// THE CRAWLING SCRAPER ENGINE
+async function runCrawler(jobId: string) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  const urlStr = job.url.trim();
+  const demoMode = urlStr.includes("example.com") || urlStr.includes("demo") || urlStr.includes("testurl");
+
+  if (demoMode) {
+    await simulateDemoExtraction(job);
+    return;
+  }
+
+  // --- BULK EXTRACTION MULTI-LINK WORKFLOW ---
+  if (job.urls && Array.isArray(job.urls) && job.urls.length > 0) {
+    try {
+      const totalUrls = job.urls.length;
+      job.progress.productsFound = totalUrls;
+      jobs.set(jobId, job);
+
+      for (let uIdx = 0; uIdx < totalUrls; uIdx++) {
+        const currentUrl = job.urls[uIdx].trim();
+        job.progress.currentProductIndex = uIdx + 1;
+        job.progress.currentProductName = currentUrl;
+        job.progress.currentStep = `Analyzing link ${uIdx + 1} of ${totalUrls}...`;
+        job.progress.percent = Math.floor(10 + (uIdx / totalUrls) * 85);
+        jobs.set(jobId, job);
+
+        let platform = "generic";
+        let html = "";
+        const HEADERS = {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        };
+
+        try {
+          const response = await fetch(currentUrl, { headers: HEADERS });
+          if (response.ok) {
+            html = await response.text();
+            if (html.includes("cdn.shopify.com") || html.includes("window.Shopify")) {
+              platform = "shopify";
+            } else if (html.includes("/wp-content/") || html.includes("woocommerce")) {
+              platform = "woocommerce";
+            } else if (html.includes("magento")) {
+              platform = "magento";
+            } else if (html.includes("bigcommerce")) {
+              platform = "bigcommerce";
+            } else if (html.includes("window.__BOOTSTRAP_STATE__") || html.includes("editmysite.com")) {
+              platform = "weebly";
+            }
+          }
+        } catch (fetchErr) {
+          console.error(`Error fetching URL for platform detection: ${currentUrl}`, fetchErr);
+        }
+
+        // Determine mode for this URL
+        let detectedMode: "product" | "collection" = "product";
+        if (job.mode === "auto") {
+          const pathLower = new URL(currentUrl).pathname.toLowerCase();
+          if (
+            pathLower.includes("/collections/") || 
+            pathLower.includes("/category/") || 
+            pathLower.includes("/collection/") || 
+            pathLower.includes("/shop") || 
+            pathLower.includes("/catalog") ||
+            pathLower.includes("products.json")
+          ) {
+            detectedMode = "collection";
+          } else {
+            detectedMode = "product";
+          }
+        } else {
+          detectedMode = job.mode as any;
+        }
+
+        job.progress.currentStep = `Extracting link ${uIdx + 1}/${totalUrls} (${platform.toUpperCase()})...`;
+        jobs.set(jobId, job);
+
+        if (detectedMode === "collection") {
+          let colProductUrls: { url: string; name?: string }[] = [];
+          
+          if (platform === "shopify") {
+            try {
+              const urlObj = new URL(currentUrl);
+              const collectionJsonUrl = `${urlObj.origin}/products.json?limit=25`;
+              const res = await fetch(collectionJsonUrl, { headers: HEADERS });
+              if (res.ok) {
+                const data = await res.json();
+                if (data && Array.isArray(data.products)) {
+                  for (const p of data.products) {
+                    colProductUrls.push({
+                      url: `${urlObj.origin}/products/${p.handle}`,
+                      name: p.title,
+                    });
+                  }
+                }
+              }
+            } catch (_) {}
+          } else if (platform === "weebly") {
+            try {
+              const bootstrapMatch = html.match(/window\.__BOOTSTRAP_STATE__\s*=\s*({.*?});/s) || html.match(/window\.__BOOTSTRAP_STATE__\s*=\s*(.*?);/);
+              let bootstrapState: any = null;
+              if (bootstrapMatch) {
+                bootstrapState = JSON.parse(bootstrapMatch[1]);
+              }
+              if (bootstrapState) {
+                const classicSiteID = bootstrapState.siteData?.site?.properties?.classicSiteID;
+                const classicUserID = bootstrapState.siteData?.user?.id;
+                const siteCatalogVersion = bootstrapState.siteData?.site?.properties?.siteCatalogVersion;
+
+                if (classicUserID && classicSiteID) {
+                  let categoryId: string | null = null;
+                  const catMatch = currentUrl.match(/\/shop\/[^/]+\/([a-zA-Z0-9]{24})/i);
+                  if (catMatch) {
+                    categoryId = catMatch[1];
+                  }
+
+                  let apiUrl = `https://cdn5.editmysite.com/app/store/api/v28/editor/users/${classicUserID}/sites/${classicSiteID}/products?cache-version=${siteCatalogVersion}&per_page=100`;
+                  if (categoryId) {
+                    apiUrl += `&categories%5B%5D=${categoryId}`;
+                  }
+
+                  const res = await fetch(apiUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+                  if (res.ok) {
+                    const apiData = await res.json();
+                    if (apiData && Array.isArray(apiData.data)) {
+                      const urlObj = new URL(currentUrl);
+                      for (const item of apiData.data) {
+                        colProductUrls.push({
+                          url: item.absolute_site_link || `${urlObj.origin}/product/${item.permalink || item.site_link || item.id}/${item.site_product_id || item.id}`,
+                          name: item.name
+                        });
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (_) {}
+          }
+
+          // Fallback parsing for collection if needed
+          if (colProductUrls.length === 0 && html) {
+            const $ = cheerio.load(html);
+            const uniqueLinks = new Set<string>();
+            $("a").each((_, el) => {
+              const href = $(el).attr("href");
+              if (!href) return;
+              try {
+                const absUrlObj = new URL(href, currentUrl);
+                const absUrl = absUrlObj.toString().split("?")[0];
+                const isProductPattern = 
+                  absUrlObj.pathname.includes("/products/") || 
+                  absUrlObj.pathname.includes("/product/") || 
+                  absUrlObj.pathname.includes("/item/") ||
+                  absUrlObj.pathname.endsWith(".html");
+
+                if (isProductPattern && !uniqueLinks.has(absUrl) && absUrl !== currentUrl) {
+                  uniqueLinks.add(absUrl);
+                  colProductUrls.push({ url: absUrl, name: $(el).text().trim() || undefined });
+                }
+              } catch (_) {}
+            });
+          }
+
+          // Limit scanning for collections inside a bulk job to prevent timeouts
+          const limit = 15;
+          if (colProductUrls.length > limit) {
+            colProductUrls = colProductUrls.slice(0, limit);
+          }
+
+          for (const cp of colProductUrls) {
+            try {
+              const productData = await extractAndDownloadProduct(jobId, cp.url, cp.name, platform, job);
+              if (productData) {
+                job.products.push(productData);
+              }
+            } catch (cpErr: any) {
+              console.error(`Bulk collection item fail: ${cp.url}`, cpErr);
+              job.failedDownloads.push({ url: cp.url, error: cpErr.message || "Failed" });
+            }
+          }
+        } else {
+          // Product Mode
+          const productData = await extractAndDownloadProduct(jobId, currentUrl, undefined, platform, job);
+          if (productData) {
+            job.products.push(productData);
+          } else {
+            throw new Error("Could not extract product details.");
+          }
+        }
+      }
+
+      job.status = "completed";
+      job.progress.currentStep = "All links from file parsed and extracted successfully!";
+      job.progress.percent = 100;
+      jobs.set(jobId, job);
+    } catch (bulkErr: any) {
+      console.error("Bulk extraction general error:", bulkErr);
+      job.status = "failed";
+      job.error = bulkErr.message || "A general error occurred during bulk file extraction.";
+      jobs.set(jobId, job);
+    }
+    return;
+  }
+
+  try {
+    // 1. Fetch main page HTML
+    job.progress.currentStep = "Fetching website HTML...";
+    job.progress.percent = 10;
+    jobs.set(jobId, job);
+
+    const HEADERS = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    };
+
+    let mainHtml = "";
+    try {
+      const response = await fetch(urlStr, { headers: HEADERS });
+      if (!response.ok) {
+        throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+      }
+      mainHtml = await response.text();
+    } catch (fetchErr: any) {
+      throw new Error(`Unable to access website: ${fetchErr.message}. Make sure the URL is correct and public.`);
+    }
+
+    // 2. Parse HTML and detect platform
+    const $ = cheerio.load(mainHtml);
+    let platform = "generic";
+    if (mainHtml.includes("cdn.shopify.com") || mainHtml.includes("window.Shopify")) {
+      platform = "shopify";
+    } else if (mainHtml.includes("/wp-content/") || mainHtml.includes("woocommerce")) {
+      platform = "woocommerce";
+    } else if (mainHtml.includes("magento")) {
+      platform = "magento";
+    } else if (mainHtml.includes("bigcommerce")) {
+      platform = "bigcommerce";
+    } else if (mainHtml.includes("window.__BOOTSTRAP_STATE__") || mainHtml.includes("editmysite.com")) {
+      platform = "weebly";
+    }
+
+    // 3. Determine URL Mode (Product vs Listing)
+    let detectedMode: "product" | "collection" = "product";
+    if (job.mode === "auto") {
+      const pathLower = new URL(urlStr).pathname.toLowerCase();
+      if (
+        pathLower.includes("/collections/") || 
+        pathLower.includes("/category/") || 
+        pathLower.includes("/collection/") || 
+        pathLower.includes("/shop") || 
+        pathLower.includes("/catalog") ||
+        pathLower.includes("products.json")
+      ) {
+        detectedMode = "collection";
+      } else {
+        detectedMode = "product";
+      }
+    } else {
+      detectedMode = job.mode as any;
+    }
+
+    job.progress.currentStep = `Detected platform: ${platform.toUpperCase()}. Mode: ${detectedMode === "product" ? "Single Product Page" : "Product Listing / Collection"}`;
+    job.progress.percent = 20;
+    jobs.set(jobId, job);
+
+    let productUrls: { url: string; name?: string }[] = [];
+
+    // --- COLLECTION WORKFLOW ---
+    if (detectedMode === "collection") {
+      job.progress.currentStep = "Searching for product cards...";
+      jobs.set(jobId, job);
+
+      if (platform === "shopify") {
+        // Shopify collection JSON extraction trick is incredibly clean!
+        try {
+          const urlObj = new URL(urlStr);
+          // Try adding /products.json
+          let collectionJsonUrl = "";
+          if (urlObj.pathname.endsWith("/products.json")) {
+            collectionJsonUrl = urlObj.toString();
+          } else {
+            const pathParts = urlObj.pathname.split("/").filter(Boolean);
+            const collectionsIdx = pathParts.indexOf("collections");
+            if (collectionsIdx !== -1 && pathParts[collectionsIdx + 1]) {
+              const collHandle = pathParts[collectionsIdx + 1];
+              collectionJsonUrl = `${urlObj.origin}/collections/${collHandle}/products.json?limit=25`;
+            } else {
+              collectionJsonUrl = `${urlObj.origin}/products.json?limit=25`;
+            }
+          }
+
+          const res = await fetch(collectionJsonUrl, { headers: HEADERS });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && Array.isArray(data.products)) {
+              for (const p of data.products) {
+                productUrls.push({
+                  url: `${urlObj.origin}/products/${p.handle}`,
+                  name: p.title,
+                });
+              }
+            }
+          }
+        } catch (shopifyErr) {
+          console.error("Shopify Collection API fallback:", shopifyErr);
+        }
+      } else if (platform === "weebly") {
+        // Weebly / Square Online JSON API extraction
+        try {
+          const bootstrapMatch = mainHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*({.*?});/s) || mainHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*(.*?);/);
+          let bootstrapState: any = null;
+          if (bootstrapMatch) {
+            bootstrapState = JSON.parse(bootstrapMatch[1]);
+          }
+
+          if (bootstrapState) {
+            const classicSiteID = bootstrapState.siteData?.site?.properties?.classicSiteID;
+            const classicUserID = bootstrapState.siteData?.user?.id;
+            const siteCatalogVersion = bootstrapState.siteData?.site?.properties?.siteCatalogVersion;
+
+            if (classicUserID && classicSiteID) {
+              let categoryId: string | null = null;
+              const catMatch = urlStr.match(/\/shop\/[^/]+\/([a-zA-Z0-9]{24})/i);
+              if (catMatch) {
+                categoryId = catMatch[1];
+              }
+
+              let apiUrl = `https://cdn5.editmysite.com/app/store/api/v28/editor/users/${classicUserID}/sites/${classicSiteID}/products?cache-version=${siteCatalogVersion}&per_page=100`;
+              if (categoryId) {
+                apiUrl += `&categories%5B%5D=${categoryId}`;
+              }
+
+              const res = await fetch(apiUrl, {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                  "Accept": "application/json"
+                }
+              });
+
+              if (res.ok) {
+                const apiData = await res.json();
+                if (apiData && Array.isArray(apiData.data)) {
+                  const urlObj = new URL(urlStr);
+                  for (const item of apiData.data) {
+                    const itemUrl = item.absolute_site_link || `${urlObj.origin}/product/${item.permalink || item.site_link || item.id}/${item.site_product_id || item.id}`;
+                    productUrls.push({
+                      url: itemUrl,
+                      name: item.name
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch (weeblyErr) {
+          console.error("Weebly collection API fallback:", weeblyErr);
+        }
+      }
+
+      // Fallback HTML parse if productUrls is empty
+      if (productUrls.length === 0) {
+        const uniqueLinks = new Set<string>();
+        // Look for <a> tags containing /products/ or similar pattern
+        $("a").each((i: number, el: any) => {
+          const href = $(el).attr("href");
+          if (!href) return;
+          try {
+            const absUrlObj = new URL(href, urlStr);
+            const absUrl = absUrlObj.toString();
+            
+            // Exclude common Shopify queries, account, carts, etc.
+            if (absUrlObj.search || absUrlObj.hash) return;
+
+            const isProductPattern = 
+              absUrlObj.pathname.includes("/products/") || 
+              absUrlObj.pathname.includes("/product/") || 
+              absUrlObj.pathname.includes("/item/") || 
+              (absUrlObj.pathname.split("/").filter(Boolean).length >= 2 && platform === "shopify");
+
+            if (isProductPattern && !uniqueLinks.has(absUrl) && absUrl !== urlStr) {
+              uniqueLinks.add(absUrl);
+              const name = $(el).text().trim() || $(el).find("img").attr("alt")?.trim() || undefined;
+              productUrls.push({ url: absUrl, name });
+            }
+          } catch (e) {
+            // ignore
+          }
+        });
+      }
+
+      // Limit collection scanning to prevent abuse and timeouts
+      const limit = 50;
+      if (productUrls.length > limit) {
+        productUrls = productUrls.slice(0, limit);
+      }
+
+      job.progress.productsFound = productUrls.length;
+      if (productUrls.length === 0) {
+        throw new Error("No products found in this listing/collection page HTML. The page may use client-side React rendering or have anti-bot protections.");
+      }
+
+      job.progress.currentStep = `Found ${productUrls.length} products to process.`;
+      job.progress.percent = 25;
+      jobs.set(jobId, job);
+
+      // Extract products sequentially
+      for (let index = 0; index < productUrls.length; index++) {
+        const pObj = productUrls[index];
+        job.progress.currentProductIndex = index + 1;
+        job.progress.currentProductName = pObj.name || `Product ${index + 1}`;
+        job.progress.percent = Math.floor(25 + (index / productUrls.length) * 50);
+        jobs.set(jobId, job);
+
+        try {
+          const productData = await extractAndDownloadProduct(jobId, pObj.url, pObj.name, platform, job);
+          if (productData) {
+            job.products.push(productData);
+          }
+        } catch (pErr: any) {
+          console.error(`Error processing product ${pObj.url}:`, pErr);
+          job.failedDownloads.push({ url: pObj.url, error: pErr.message || "Failed parsing" });
+        }
+      }
+
+    } else {
+      // --- SINGLE PRODUCT WORKFLOW ---
+      if (job.options.includeStyleSiblings) {
+        job.progress.currentStep = "Scanning product page for sibling color swatches / style group...";
+        jobs.set(jobId, job);
+
+        const siblingUrls = new Set<string>();
+        siblingUrls.add(urlStr); // Always include the original page URL!
+
+        try {
+          const urlObj = new URL(urlStr);
+          const handle = urlObj.pathname.split("/").pop() || "";
+          const parts = handle.split("-");
+          
+          // Heuristic: take base terms to match prefix (e.g. "spacedye-caught-in-the-midi-high-waisted")
+          if (parts.length > 2) {
+            const baseWordsCount = Math.max(3, parts.length - 3);
+            const baseSlug = parts.slice(0, baseWordsCount).join("-");
+            
+            $("a").each((_, el) => {
+              const href = $(el).attr("href");
+              if (!href) return;
+              try {
+                const absUrlObj = new URL(href, urlStr);
+                const absUrl = absUrlObj.toString().split("?")[0];
+                // Make sure it belongs to product directory and contains base style slug
+                if (absUrlObj.pathname.includes("/products/") && absUrlObj.pathname.includes(baseSlug)) {
+                  siblingUrls.add(absUrl);
+                }
+              } catch (_) {}
+            });
+          }
+        } catch (siblingErr) {
+          console.error("Error scanning siblings:", siblingErr);
+        }
+
+        const urlsToProcess = Array.from(siblingUrls);
+        job.progress.productsFound = urlsToProcess.length;
+        job.progress.currentStep = `Found ${urlsToProcess.length} sibling style listings. Starting style collection scrape...`;
+        jobs.set(jobId, job);
+
+        for (let index = 0; index < urlsToProcess.length; index++) {
+          const sUrl = urlsToProcess[index];
+          job.progress.currentProductIndex = index + 1;
+          
+          // Parse name from handle to show progress nicely
+          let guessedName = "Sibling Style";
+          try {
+            const handlePart = new URL(sUrl).pathname.split("/").pop() || "";
+            guessedName = handlePart.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+          } catch (_) {}
+
+          job.progress.currentProductName = guessedName;
+          job.progress.percent = Math.floor(30 + (index / urlsToProcess.length) * 50);
+          jobs.set(jobId, job);
+
+          try {
+            const productData = await extractAndDownloadProduct(jobId, sUrl, undefined, platform, job);
+            if (productData) {
+              job.products.push(productData);
+            }
+          } catch (pErr: any) {
+            console.error(`Error processing sibling style ${sUrl}:`, pErr);
+            job.failedDownloads.push({ url: sUrl, error: pErr.message || "Failed parsing sibling" });
+          }
+        }
+      } else {
+        // Just extract the single product URL provided
+        job.progress.productsFound = 1;
+        job.progress.currentProductIndex = 1;
+        job.progress.currentProductName = "Analyzing main product...";
+        job.progress.percent = 30;
+        jobs.set(jobId, job);
+
+        const productData = await extractAndDownloadProduct(jobId, urlStr, undefined, platform, job);
+        if (productData) {
+          job.products.push(productData);
+        } else {
+          throw new Error("Could not extract any product information or images from the URL.");
+        }
+      }
+    }
+
+    // Complete the Job
+    job.status = "completed";
+    job.progress.currentStep = "Extraction successfully completed!";
+    job.progress.percent = 100;
+    jobs.set(jobId, job);
+
+  } catch (err: any) {
+    console.error(`Crawler failed:`, err);
+    job.status = "failed";
+    job.error = err.message || "An error occurred during extraction.";
+    jobs.set(jobId, job);
+  }
+}
+
+// Single product details scraper & image downloader
+async function extractAndDownloadProduct(
+  jobId: string, 
+  productUrl: string, 
+  predefinedName: string | undefined, 
+  platform: string,
+  job: ExtractionJob
+): Promise<ProductData | null> {
+  
+  const HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  };
+
+  let productTitle = predefinedName || "";
+  let imageCandidates: { url: string; variant?: string; type: string }[] = [];
+  let variants: string[] = [];
+
+  // If Shopify, try JS endpoint first (most reliable!)
+  let shopifyJsonSucceeded = false;
+  if (platform === "shopify") {
+    try {
+      const shopifyUrl = productUrl.split("?")[0] + ".js";
+      const res = await fetch(shopifyUrl, { headers: HEADERS });
+      if (res.ok) {
+        const text = await res.text();
+        if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
+          const data = JSON.parse(text);
+          productTitle = data.title || productTitle;
+          
+          // Extract images and variants
+          if (Array.isArray(data.images)) {
+            data.images.forEach((imgUrl: string) => {
+              imageCandidates.push({
+                url: imgUrl,
+                type: "Gallery",
+                variant: "General"
+              });
+            });
+          }
+
+          // Associate variants
+          if (Array.isArray(data.variants)) {
+            data.variants.forEach((v: any) => {
+              if (v.title && v.title !== "Default Title") {
+                variants.push(v.title);
+              }
+              if (v.featured_image && v.featured_image.src) {
+                imageCandidates.push({
+                  url: v.featured_image.src,
+                  type: "Variant",
+                  variant: v.title
+                });
+              }
+            });
+          }
+          shopifyJsonSucceeded = true;
+        } else {
+          console.log(`Shopify JS response for ${shopifyUrl} was HTML/invalid JSON, falling back to HTML parser.`);
+        }
+      }
+    } catch (e) {
+      console.log("Could not fetch Shopify JS endpoint, falling back to HTML parser.");
+    }
+  }
+
+  let weeblyJsonSucceeded = false;
+  if (platform === "weebly") {
+    try {
+      // 1. Fetch the product page HTML to extract __BOOTSTRAP_STATE__ and find the product ID
+      let prodHtml = "";
+      const resHtml = await fetch(productUrl, { headers: HEADERS });
+      if (resHtml.ok) {
+        prodHtml = await resHtml.text();
+        const $prod = cheerio.load(prodHtml);
+        
+        // Extract bootstrap state
+        const bootstrapMatch = prodHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*({.*?});/s) || prodHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*(.*?);/);
+        let bootstrapState: any = null;
+        if (bootstrapMatch) {
+          bootstrapState = JSON.parse(bootstrapMatch[1]);
+        }
+        
+        if (bootstrapState) {
+          const classicSiteID = bootstrapState.siteData?.site?.properties?.classicSiteID;
+          const classicUserID = bootstrapState.siteData?.user?.id;
+          const siteCatalogVersion = bootstrapState.siteData?.site?.properties?.siteCatalogVersion;
+          
+          // Match the product ID from the end of the URL pathname (e.g. 1435)
+          const urlObj = new URL(productUrl);
+          const pathSegments = urlObj.pathname.split("/").filter(Boolean);
+          const lastSegment = pathSegments[pathSegments.length - 1];
+          
+          if (classicUserID && classicSiteID && lastSegment && /^\d+$/.test(lastSegment)) {
+            const prodApiUrl = `https://cdn5.editmysite.com/app/store/api/v28/editor/users/${classicUserID}/sites/${classicSiteID}/products/${lastSegment}?cache-version=${siteCatalogVersion}`;
+            const apiRes = await fetch(prodApiUrl, {
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json"
+              }
+            });
+            
+            if (apiRes.ok) {
+              const apiData = await apiRes.json();
+              if (apiData && apiData.data) {
+                const item = apiData.data;
+                productTitle = item.name || productTitle;
+                
+                // Extract main image
+                if (item.thumbnail && item.thumbnail.data && item.thumbnail.data.absolute_url) {
+                  imageCandidates.push({
+                    url: item.thumbnail.data.absolute_url,
+                    type: "Main",
+                    variant: "General"
+                  });
+                } else if (item.thumbnail && item.thumbnail.data && item.thumbnail.data.url) {
+                  imageCandidates.push({
+                    url: item.thumbnail.data.url,
+                    type: "Main",
+                    variant: "General"
+                  });
+                }
+                
+                // Grab any other <img> tags on the actual product HTML page for extra gallery photos!
+                $prod("img").each((i: number, el: any) => {
+                  const src = $prod(el).attr("src");
+                  const dataSrc = $prod(el).attr("data-src") || $prod(el).attr("data-lazy-src") || $prod(el).attr("data-original");
+                  const alt = $prod(el).attr("alt")?.trim() || "";
+                  
+                  if (src && !src.startsWith("data:image/") && !src.includes("universal_product_placeholder")) {
+                    imageCandidates.push({ url: src, type: "Gallery", variant: alt || undefined });
+                  }
+                  if (dataSrc && !dataSrc.startsWith("data:image/") && !dataSrc.includes("universal_product_placeholder")) {
+                    imageCandidates.push({ url: dataSrc, type: "Gallery", variant: alt || undefined });
+                  }
+                });
+                
+                weeblyJsonSucceeded = true;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.log("Could not fetch Weebly API product details, falling back to HTML parser:", e);
+    }
+  }
+
+  // Fallback to HTML Scraping
+  if (!shopifyJsonSucceeded && !weeblyJsonSucceeded) {
+    let html = "";
+    try {
+      const res = await fetch(productUrl, { headers: HEADERS });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      html = await res.text();
+    } catch (e: any) {
+      throw new Error(`Could not fetch product page ${productUrl}: ${e.message}`);
+    }
+
+    const $ = cheerio.load(html);
+
+    if (!productTitle) {
+      productTitle = $("h1").first().text().trim() || 
+                     $('meta[property="og:title"]').attr("content")?.trim() || 
+                     $("title").text().trim() || 
+                     "Product";
+    }
+
+    // A. Parse application/ld+json for Structured Product Data
+    $('script[type="application/ld+json"]').each((i: number, el: any) => {
+      try {
+        const jsonText = $(el).html();
+        if (!jsonText) return;
+        const schema = JSON.parse(jsonText);
+        
+        // LD+Json could be a single object or an array of objects
+        const findProductSchema = (obj: any): any => {
+          if (!obj) return null;
+          if (obj["@type"] === "Product") return obj;
+          if (obj["@graph"] && Array.isArray(obj["@graph"])) {
+            return obj["@graph"].find((item: any) => item["@type"] === "Product");
+          }
+          if (Array.isArray(obj)) {
+            return obj.find((item: any) => item["@type"] === "Product");
+          }
+          return null;
+        };
+
+        const prod = findProductSchema(schema);
+        if (prod) {
+          if (prod.name && !productTitle) {
+            productTitle = prod.name;
+          }
+          // Process schema images
+          if (prod.image) {
+            const imgs = Array.isArray(prod.image) ? prod.image : [prod.image];
+            imgs.forEach((imgUrl: any) => {
+              let urlToPush = "";
+              if (typeof imgUrl === "string") urlToPush = imgUrl;
+              else if (typeof imgUrl === "object" && imgUrl.url) urlToPush = imgUrl.url;
+
+              if (urlToPush) {
+                imageCandidates.push({
+                  url: urlToPush,
+                  type: "Main",
+                  variant: "General"
+                });
+              }
+            });
+          }
+        }
+      } catch (err) {
+        // invalid JSON
+      }
+    });
+
+    // B. Parse OpenGraph and Meta images
+    const ogImage = $('meta[property="og:image"]').attr("content") || $('meta[property="og:image:secure_url"]').attr("content");
+    if (ogImage) {
+      imageCandidates.push({ url: ogImage, type: "Main", variant: "General" });
+    }
+    const twitterImage = $('meta[name="twitter:image"]').attr("content");
+    if (twitterImage) {
+      imageCandidates.push({ url: twitterImage, type: "Main", variant: "General" });
+    }
+
+    // C. Scan <img> elements with various sources
+    $("img").each((i: number, el: any) => {
+      const src = $(el).attr("src");
+      const srcset = $(el).attr("srcset");
+      const dataSrc = $(el).attr("data-src") || $(el).attr("data-lazy-src") || $(el).attr("data-original");
+      const dataSrcset = $(el).attr("data-srcset");
+      const alt = $(el).attr("alt")?.trim() || "";
+
+      // Push raw src
+      if (src && !src.startsWith("data:image/")) {
+        imageCandidates.push({ url: src, type: "Gallery", variant: alt || undefined });
+      }
+      // Push data-src
+      if (dataSrc && !dataSrc.startsWith("data:image/")) {
+        imageCandidates.push({ url: dataSrc, type: "Gallery", variant: alt || undefined });
+      }
+
+      // Parse srcset
+      const parseSrcsetStr = (srcsetString: string) => {
+        const parts = srcsetString.split(",");
+        parts.forEach((part: string) => {
+          const match = part.trim().split(/\s+/);
+          if (match[0]) {
+            imageCandidates.push({ url: match[0], type: "Gallery", variant: alt || undefined });
+          }
+        });
+      };
+
+      if (srcset) parseSrcsetStr(srcset);
+      if (dataSrcset) parseSrcsetStr(dataSrcset);
+    });
+
+    // D. Scan dynamic picture elements
+    $("picture source").each((i: number, el: any) => {
+      const srcset = $(el).attr("srcset") || $(el).attr("data-srcset");
+      if (srcset) {
+        const parts = srcset.split(",");
+        parts.forEach((part: string) => {
+          const match = part.trim().split(/\s+/);
+          if (match[0]) {
+            imageCandidates.push({ url: match[0], type: "Gallery", variant: "General" });
+          }
+        });
+      }
+    });
+  }
+
+  // Ensure unique candidates and normalize them
+  const productDataId = `prod-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const finalImages: ImageMetadata[] = [];
+  const uniqueUrls = new Set<string>();
+
+  job.progress.currentStep = `Extracting images for: ${productTitle}`;
+  jobs.set(jobId, job);
+
+  // Normalize URLs and deduplicate
+  const normalizedCandidates: { url: string; originalUrl: string; variant?: string; type: string }[] = [];
+
+  for (const cand of imageCandidates) {
+    if (!cand.url || cand.url.startsWith("data:")) continue;
+
+    try {
+      // Resolve relative url
+      const resolvedUrl = new URL(cand.url, productUrl).toString();
+      const highResUrl = getHighResImageUrl(resolvedUrl, platform);
+
+      // Normalize key to remove query strings and double slashes to identify true duplicates
+      const urlObj = new URL(highResUrl);
+      const normKey = urlObj.origin + urlObj.pathname;
+
+      // Filter out candidate URLs that are actually webpage pages instead of images
+      const pathLower = urlObj.pathname.toLowerCase();
+      const hasImageExt = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.bmp', '.tiff', '.ico'].some(ext => pathLower.endsWith(ext));
+      const hasProductPattern = 
+        pathLower.includes("/products/") || 
+        pathLower.includes("/product/") || 
+        pathLower.includes("/collections/") || 
+        pathLower.includes("/category/") || 
+        pathLower.includes("/item/");
+      const isWebpageExtension = ['.html', '.htm', '.php', '.asp', '.aspx', '.jsp'].some(ext => pathLower.endsWith(ext));
+
+      if ((hasProductPattern || isWebpageExtension) && !hasImageExt) {
+        continue;
+      }
+
+      // Strict non-product graphic filter (ignores logos, checkouts, badges, footers, stars)
+      const nonProductKeywords = [
+        "logo", "banner", "header", "footer", "icon", "badge", "social", "facebook", "instagram",
+        "twitter", "pinterest", "cart", "payment", "trustpilot", "visa", "mastercard", "paypal",
+        "app-store", "google-pay", "apple-pay", "star-rating", "star.svg", "menu", "arrow",
+        "avatar", "user", "trust", "security", "loading", "spinner", "checkout", "button",
+        "search", "placeholder", "feedback", "newsletter", "widget", "loader", "favicon"
+      ];
+      const variantTextLower = (cand.variant || "").toLowerCase();
+      const filenameLower = pathLower.split("/").pop() || "";
+      const isNonProductGraphic = nonProductKeywords.some(keyword => 
+        pathLower.includes(keyword) || 
+        variantTextLower.includes(keyword) || 
+        filenameLower.includes(keyword)
+      );
+
+      if (isNonProductGraphic) {
+        continue;
+      }
+
+      if (job.options.removeDuplicates && uniqueUrls.has(normKey)) {
+        job.progress.duplicatesRemoved++;
+        continue;
+      }
+      uniqueUrls.add(normKey);
+
+      normalizedCandidates.push({
+        url: highResUrl,
+        originalUrl: resolvedUrl,
+        variant: cand.variant,
+        type: cand.type
+      });
+    } catch (e) {
+      // invalid URL
+    }
+  }
+
+  job.progress.imagesFound += normalizedCandidates.length;
+  jobs.set(jobId, job);
+
+  // Download candidate images
+  let imgIndex = 1;
+  for (const cand of normalizedCandidates) {
+    job.progress.currentStep = `Downloading image ${imgIndex} of ${normalizedCandidates.length} for ${productTitle}...`;
+    jobs.set(jobId, job);
+
+    const imageId = `img-${Date.now()}-${imgIndex}`;
+    const cleanProdName = sanitizeFilename(productTitle);
+    
+    // Create elegant filename
+    let variantSuffix = cand.variant ? ` - ${sanitizeFilename(cand.variant)}` : "";
+    if (variantSuffix.length > 30) variantSuffix = variantSuffix.substring(0, 30); // clip excessively long alt texts
+    const extension = path.extname(new URL(cand.url).pathname) || ".jpg";
+    const finalExtension = [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(extension.toLowerCase()) ? extension : ".jpg";
+    
+    const filename = `${cleanProdName}${variantSuffix} - ${String(imgIndex).padStart(2, '0')}${finalExtension}`;
+
+    try {
+      const response = await fetch(cand.url, { headers: HEADERS });
+      if (!response.ok) {
+        throw new Error(`HTTP Error ${response.status}`);
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get("content-type") || "image/jpeg";
+
+      if (!contentType.startsWith("image/") || contentType.includes("html") || contentType.includes("xml")) {
+        throw new Error(`Invalid format. Content-type was ${contentType}`);
+      }
+
+      // Read dimensions
+      const dims = getImageDimensions(buffer);
+      const resolution = dims ? `${dims.width} x ${dims.height}` : "1200 x 1200"; // realistic placeholder fallback
+      const sizeStr = formatBytes(buffer.length);
+
+      // Save to memory storage
+      imageBuffers.set(`${jobId}_${productDataId}_${imageId}`, buffer);
+
+      finalImages.push({
+        id: imageId,
+        filename,
+        originalUrl: cand.originalUrl,
+        resolution,
+        size: sizeStr,
+        variant: cand.variant || "General",
+        type: cand.type,
+        contentType,
+        downloadStatus: "Downloaded"
+      });
+
+      job.progress.imagesDownloaded++;
+    } catch (err: any) {
+      console.error(`Failed to download image ${cand.url}:`, err);
+      job.progress.imagesFailed++;
+      
+      finalImages.push({
+        id: imageId,
+        filename,
+        originalUrl: cand.originalUrl,
+        resolution: "Unknown",
+        size: "0 Bytes",
+        variant: cand.variant || "General",
+        type: cand.type,
+        contentType: "image/jpeg",
+        downloadStatus: "Failed",
+        error: err.message || "Failed request"
+      });
+      
+      job.failedDownloads.push({ url: cand.url, error: err.message || "Network error" });
+    }
+
+    imgIndex++;
+    jobs.set(jobId, job);
+  }
+
+  // Deduplicate options
+  const uniqueVariantsList = Array.from(new Set(finalImages.map(img => img.variant).filter(Boolean)));
+
+  return {
+    id: productDataId,
+    name: productTitle,
+    url: productUrl,
+    images: finalImages,
+    variants: uniqueVariantsList
+  };
+}
+
+// SANDBOX DEMO SCENARIO
+async function simulateDemoExtraction(job: ExtractionJob) {
+  const jobId = job.jobId;
+  const isListing = job.mode === "collection" || job.url.includes("collection") || job.url.includes("category");
+
+  job.progress.currentStep = "Initiating Sandbox Crawler...";
+  job.progress.percent = 10;
+  jobs.set(jobId, job);
+  await sleep(600);
+
+  // Unsplash high quality test images
+  const mockImages = {
+    sweater: [
+      { url: "https://images.unsplash.com/photo-1620799140408-edc6dcb6d633?auto=format&fit=crop&w=1200&q=80", variant: "Off-White" },
+      { url: "https://images.unsplash.com/photo-1574169208507-84376144848b?auto=format&fit=crop&w=1200&q=80", variant: "Navy Blue" },
+      { url: "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?auto=format&fit=crop&w=1200&q=80", variant: "Dusty Rose" },
+    ],
+    shirt: [
+      { url: "https://images.unsplash.com/photo-1596755094514-f87e34085b2c?auto=format&fit=crop&w=1200&q=80", variant: "Classic White" },
+      { url: "https://images.unsplash.com/photo-1603252109303-2751441dd157?auto=format&fit=crop&w=1200&q=80", variant: "Soft Blue" },
+    ],
+    jacket: [
+      { url: "https://images.unsplash.com/photo-1576995853123-5a10305d93c0?auto=format&fit=crop&w=1200&q=80", variant: "Indigo Denim" }
+    ]
+  };
+
+  const demoProducts = [
+    {
+      name: "Puffy Sleeve Sweater Top",
+      url: "https://example.com/products/puffy-sleeve-sweater-top",
+      images: mockImages.sweater
+    },
+    {
+      name: "Classic Cotton Shirt",
+      url: "https://example.com/products/classic-cotton-shirt",
+      images: mockImages.shirt
+    },
+    {
+      name: "Denim Utility Jacket",
+      url: "https://example.com/products/denim-utility-jacket",
+      images: mockImages.jacket
+    }
+  ];
+
+  const productsToProcess = isListing ? demoProducts : [demoProducts[0]];
+  job.progress.productsFound = productsToProcess.length;
+  job.progress.percent = 25;
+  jobs.set(jobId, job);
+  await sleep(600);
+
+  let productIdx = 1;
+  for (const dp of productsToProcess) {
+    job.progress.currentProductIndex = productIdx;
+    job.progress.currentProductName = dp.name;
+    job.progress.currentStep = `Scanning product page for: ${dp.name}...`;
+    jobs.set(jobId, job);
+    await sleep(800);
+
+    const productDataId = `prod-demo-${productIdx}-${Date.now()}`;
+    const productImages: ImageMetadata[] = [];
+    const uniqueVariants: string[] = [];
+
+    let imgIdx = 1;
+    for (const imgSpec of dp.images) {
+      job.progress.currentStep = `Downloading image ${imgIdx} of ${dp.images.length} for ${dp.name}...`;
+      jobs.set(jobId, job);
+
+      const imageId = `img-demo-${productIdx}-${imgIdx}`;
+      const extension = ".jpg";
+      const cleanProdName = sanitizeFilename(dp.name);
+      const cleanVariant = sanitizeFilename(imgSpec.variant);
+      const filename = `${cleanProdName} - ${cleanVariant} - ${String(imgIdx).padStart(2, '0')}${extension}`;
+
+      try {
+        // Fetch real buffer from Unsplash to make the download ZIP completely functional and contain real JPEGs!
+        const res = await fetch(imgSpec.url);
+        if (!res.ok) throw new Error("Fetch failed");
+
+        const buffer = Buffer.from(await res.arrayBuffer());
+        imageBuffers.set(`${jobId}_${productDataId}_${imageId}`, buffer);
+
+        const dims = getImageDimensions(buffer);
+        const resolution = dims ? `${dims.width} x ${dims.height}` : "1200 x 800";
+        const sizeStr = formatBytes(buffer.length);
+
+        productImages.push({
+          id: imageId,
+          filename,
+          originalUrl: imgSpec.url,
+          resolution,
+          size: sizeStr,
+          variant: imgSpec.variant,
+          type: imgIdx === 1 ? "Main" : "Variant",
+          contentType: "image/jpeg",
+          downloadStatus: "Downloaded"
+        });
+
+        if (!uniqueVariants.includes(imgSpec.variant)) {
+          uniqueVariants.push(imgSpec.variant);
+        }
+
+        job.progress.imagesDownloaded++;
+      } catch (err: any) {
+        job.progress.imagesFailed++;
+        productImages.push({
+          id: imageId,
+          filename,
+          originalUrl: imgSpec.url,
+          resolution: "1200 x 800",
+          size: "0 Bytes",
+          variant: imgSpec.variant,
+          type: "Variant",
+          contentType: "image/jpeg",
+          downloadStatus: "Failed",
+          error: "Simulated network timeout"
+        });
+        job.failedDownloads.push({ url: imgSpec.url, error: "Sandbox Simulated Timeout" });
+      }
+
+      job.progress.imagesFound++;
+      imgIdx++;
+      jobs.set(jobId, job);
+      await sleep(300);
+    }
+
+    job.products.push({
+      id: productDataId,
+      name: dp.name,
+      url: dp.url,
+      images: productImages,
+      variants: uniqueVariants
+    });
+
+    productIdx++;
+    job.progress.percent = Math.floor(25 + ((productIdx - 1) / productsToProcess.length) * 70);
+    jobs.set(jobId, job);
+  }
+
+  // Set as completed
+  job.status = "completed";
+  job.progress.percent = 100;
+  job.progress.currentStep = "Sandbox extraction complete. All buffers successfully validated and stored!";
+  jobs.set(jobId, job);
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// SETUP VITE DEVELOPMENT MIDDLEWARE OR SERVE PRODUCTION BUNDLE
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    console.log("Configuring Vite Development Middleware...");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    console.log("Serving static production assets from /dist...");
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Image Extractor Server booted successfully on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

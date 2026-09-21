@@ -1,0 +1,6 @@
+{
+  "name": "360 RM : E-Commerce Image Extractor",
+  "description": "Extract and download product images, variants, and metadata from any ecommerce website URL, collection, or product page.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
