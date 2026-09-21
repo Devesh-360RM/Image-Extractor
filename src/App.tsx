@@ -454,30 +454,19 @@ export default function App() {
       {/* HEADER BAR */}
       <header className="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-slate-200">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-slate-100/80 border border-slate-200/80 flex items-center justify-center overflow-hidden">
-              <img 
-                id="header-logo" 
-                src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
-                alt="" 
-                className="w-full h-full object-contain" 
-              />
-            </div>
-            <div>
-              <span className="font-extrabold text-base sm:text-lg tracking-tight text-slate-900">
-                360 RM : E-Commerce Image Extractor
-              </span>
-            </div>
+          <div className="flex items-center gap-2.5">
+            <img 
+              id="header-logo" 
+              src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
+              alt="" 
+              className="w-8 h-8 object-contain rounded-full border border-slate-200/80 bg-slate-50" 
+              referrerPolicy="no-referrer"
+            />
+            <span className="font-extrabold text-base sm:text-lg tracking-tight text-slate-900">
+              360 RM : E-Commerce Image Extractor
+            </span>
           </div>
           <div className="flex items-center gap-4">
-            <a 
-              href="https://github.com" 
-              target="_blank" 
-              rel="noreferrer" 
-              className="text-xs text-slate-500 hover:text-slate-900 flex items-center gap-1 transition-colors"
-            >
-              Docs <ExternalLink className="w-3 h-3" />
-            </a>
           </div>
         </div>
       </header>
@@ -1367,11 +1356,6 @@ export default function App() {
         <p className="text-xs">
           © 2026 360 RM : E-Commerce Image Extractor. Dedicated to providing highly verified structured retail files.
         </p>
-        <div className="flex items-center justify-center gap-4 text-[11px] font-medium text-slate-400">
-          <span>Standard compliance: Shopify, WooCommerce, Magento, BigCommerce</span>
-          <span>•</span>
-          <span>In-memory secure file caching (No persistent tracking)</span>
-        </div>
       </footer>
 
       {/* PORTAL OVERLAY: FULL-RESOLUTION ZOOM LIGHTBOX */}

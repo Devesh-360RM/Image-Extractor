@@ -402,9 +402,12 @@ app.post("/api/extract", async (req, res) => {
 
   if (process.env.VERCEL) {
     // On Vercel serverless functions, execution is frozen after sending response.
-    // We await crawler completion so extraction finishes before lambda terminates.
+    // We await crawler completion with a safety timeout to prevent FUNCTION_INVOCATION_FAILED.
     try {
-      await runCrawler(jobId);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Extraction request timed out waiting for target store. Try Single Product mode or Sandbox Demo.")), 8500)
+      );
+      await Promise.race([runCrawler(jobId), timeoutPromise]);
     } catch (err: any) {
       console.error(`Error in crawler for job ${jobId}:`, err);
       const j = getJob(jobId);
