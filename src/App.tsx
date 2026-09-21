@@ -446,9 +446,6 @@ export default function App() {
               <span className="font-extrabold text-base sm:text-lg tracking-tight bg-gradient-to-r from-slate-950 to-indigo-955 bg-clip-text text-transparent">
                 360 RM : E-Commerce Image Extractor
               </span>
-              <span className="hidden sm:inline-block ml-2 px-1.5 py-0.5 text-[9px] font-bold bg-indigo-50 text-indigo-700 rounded border border-indigo-100 uppercase tracking-wider">
-                V2.1 PRO
-              </span>
             </div>
           </div>
           <div className="flex items-center gap-4">
