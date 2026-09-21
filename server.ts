@@ -7,7 +7,7 @@ import JSZip from "jszip";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import * as XLSX from "xlsx";
-import { ExtractionJob, ProductData, ImageMetadata } from "./src/types.js";
+import { ExtractionJob, ProductData, ImageMetadata } from "./src/types";
 
 // Setup __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -61,6 +61,18 @@ function getJob(jobId: string): ExtractionJob | undefined {
   return undefined;
 }
 
+const cancelledJobIds = new Set<string>();
+
+function isJobCancelled(jobId: string): boolean {
+  if (cancelledJobIds.has(jobId)) return true;
+  const job = getJob(jobId);
+  if (job?.status === "cancelled") {
+    cancelledJobIds.add(jobId);
+    return true;
+  }
+  return false;
+}
+
 function saveImageBuffer(key: string, buffer: Buffer) {
   imageBuffers.set(key, buffer);
   try {
@@ -85,6 +97,26 @@ function getImageBuffer(key: string): Buffer | undefined {
     // Ignore read error
   }
   return undefined;
+}
+
+// Helper: Fetch with strict timeout to prevent Serverless Functions from hanging
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 4500): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return response;
+  } catch (err: any) {
+    if (err.name === "AbortError" || err.message?.includes("aborted")) {
+      throw new Error(`Timeout reaching ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 // Cleanup older jobs to prevent memory growth (older than 30 minutes)
@@ -444,6 +476,20 @@ app.get("/api/jobs/:jobId", (req, res) => {
   res.json(job);
 });
 
+// API: Cancel an active extraction job
+app.post("/api/jobs/:jobId/cancel", (req, res) => {
+  const { jobId } = req.params;
+  cancelledJobIds.add(jobId);
+  const job = getJob(jobId);
+  if (job) {
+    job.status = "cancelled";
+    job.progress.currentStep = "Scrape cancelled by user";
+    job.error = "Extraction was cancelled by user.";
+    saveJob(job);
+  }
+  res.json({ success: true, jobId, status: "cancelled" });
+});
+
 // API: Get/Stream product image buffer
 app.get("/api/jobs/:jobId/products/:productId/images/:imageId", (req, res) => {
   const { jobId, productId, imageId } = req.params;
@@ -572,6 +618,7 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
 
 // THE CRAWLING SCRAPER ENGINE
 async function runCrawler(jobId: string) {
+  if (isJobCancelled(jobId)) return;
   const job = getJob(jobId);
   if (!job) return;
 
@@ -591,6 +638,7 @@ async function runCrawler(jobId: string) {
       saveJob(jobId, job);
 
       for (let uIdx = 0; uIdx < totalUrls; uIdx++) {
+        if (isJobCancelled(jobId)) return;
         const currentUrl = job.urls[uIdx].trim();
         job.progress.currentProductIndex = uIdx + 1;
         job.progress.currentProductName = currentUrl;
@@ -606,7 +654,7 @@ async function runCrawler(jobId: string) {
         };
 
         try {
-          const response = await fetch(currentUrl, { headers: HEADERS });
+          const response = await fetchWithTimeout(currentUrl, { headers: HEADERS }, 4000);
           if (response.ok) {
             html = await response.text();
             if (html.includes("cdn.shopify.com") || html.includes("window.Shopify")) {
@@ -655,7 +703,7 @@ async function runCrawler(jobId: string) {
             try {
               const urlObj = new URL(currentUrl);
               const collectionJsonUrl = `${urlObj.origin}/products.json?limit=25`;
-              const res = await fetch(collectionJsonUrl, { headers: HEADERS });
+              const res = await fetchWithTimeout(collectionJsonUrl, { headers: HEADERS }, 4000);
               if (res.ok) {
                 const data = await res.json();
                 if (data && Array.isArray(data.products)) {
@@ -692,7 +740,7 @@ async function runCrawler(jobId: string) {
                     apiUrl += `&categories%5B%5D=${categoryId}`;
                   }
 
-                  const res = await fetch(apiUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+                  const res = await fetchWithTimeout(apiUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }, 4000);
                   if (res.ok) {
                     const apiData = await res.json();
                     if (apiData && Array.isArray(apiData.data)) {
@@ -741,6 +789,7 @@ async function runCrawler(jobId: string) {
           }
 
           for (const cp of colProductUrls) {
+            if (isJobCancelled(jobId)) return;
             try {
               const productData = await extractAndDownloadProduct(jobId, cp.url, cp.name, platform, job);
               if (productData) {
@@ -753,6 +802,7 @@ async function runCrawler(jobId: string) {
           }
         } else {
           // Product Mode
+          if (isJobCancelled(jobId)) return;
           const productData = await extractAndDownloadProduct(jobId, currentUrl, undefined, platform, job);
           if (productData) {
             job.products.push(productData);
@@ -762,11 +812,13 @@ async function runCrawler(jobId: string) {
         }
       }
 
+      if (isJobCancelled(jobId)) return;
       job.status = "completed";
       job.progress.currentStep = "All links from file parsed and extracted successfully!";
       job.progress.percent = 100;
       saveJob(jobId, job);
     } catch (bulkErr: any) {
+      if (isJobCancelled(jobId)) return;
       console.error("Bulk extraction general error:", bulkErr);
       job.status = "failed";
       job.error = bulkErr.message || "A general error occurred during bulk file extraction.";
@@ -789,7 +841,7 @@ async function runCrawler(jobId: string) {
 
     let mainHtml = "";
     try {
-      const response = await fetch(urlStr, { headers: HEADERS });
+      const response = await fetchWithTimeout(urlStr, { headers: HEADERS }, 5000);
       if (!response.ok) {
         throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
       }
@@ -863,7 +915,7 @@ async function runCrawler(jobId: string) {
             }
           }
 
-          const res = await fetch(collectionJsonUrl, { headers: HEADERS });
+          const res = await fetchWithTimeout(collectionJsonUrl, { headers: HEADERS }, 4000);
           if (res.ok) {
             const data = await res.json();
             if (data && Array.isArray(data.products)) {
@@ -904,12 +956,12 @@ async function runCrawler(jobId: string) {
                 apiUrl += `&categories%5B%5D=${categoryId}`;
               }
 
-              const res = await fetch(apiUrl, {
+              const res = await fetchWithTimeout(apiUrl, {
                 headers: {
                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                   "Accept": "application/json"
                 }
-              });
+              }, 4000);
 
               if (res.ok) {
                 const apiData = await res.json();
@@ -979,6 +1031,7 @@ async function runCrawler(jobId: string) {
 
       // Extract products sequentially
       for (let index = 0; index < productUrls.length; index++) {
+        if (isJobCancelled(jobId)) return;
         const pObj = productUrls[index];
         job.progress.currentProductIndex = index + 1;
         job.progress.currentProductName = pObj.name || `Product ${index + 1}`;
@@ -999,6 +1052,7 @@ async function runCrawler(jobId: string) {
     } else {
       // --- SINGLE PRODUCT WORKFLOW ---
       if (job.options.includeStyleSiblings) {
+        if (isJobCancelled(jobId)) return;
         job.progress.currentStep = "Scanning product page for sibling color swatches / style group...";
         saveJob(jobId, job);
 
@@ -1038,6 +1092,7 @@ async function runCrawler(jobId: string) {
         saveJob(jobId, job);
 
         for (let index = 0; index < urlsToProcess.length; index++) {
+          if (isJobCancelled(jobId)) return;
           const sUrl = urlsToProcess[index];
           job.progress.currentProductIndex = index + 1;
           
@@ -1064,6 +1119,7 @@ async function runCrawler(jobId: string) {
         }
       } else {
         // Just extract the single product URL provided
+        if (isJobCancelled(jobId)) return;
         job.progress.productsFound = 1;
         job.progress.currentProductIndex = 1;
         job.progress.currentProductName = "Analyzing main product...";
@@ -1079,6 +1135,7 @@ async function runCrawler(jobId: string) {
       }
     }
 
+    if (isJobCancelled(jobId)) return;
     // Complete the Job
     job.status = "completed";
     job.progress.currentStep = "Extraction successfully completed!";
@@ -1086,6 +1143,7 @@ async function runCrawler(jobId: string) {
     saveJob(jobId, job);
 
   } catch (err: any) {
+    if (isJobCancelled(jobId)) return;
     console.error(`Crawler failed:`, err);
     job.status = "failed";
     job.error = err.message || "An error occurred during extraction.";
@@ -1101,6 +1159,7 @@ async function extractAndDownloadProduct(
   platform: string,
   job: ExtractionJob
 ): Promise<ProductData | null> {
+  if (isJobCancelled(jobId)) return null;
   
   const HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -1116,7 +1175,7 @@ async function extractAndDownloadProduct(
   if (platform === "shopify") {
     try {
       const shopifyUrl = productUrl.split("?")[0] + ".js";
-      const res = await fetch(shopifyUrl, { headers: HEADERS });
+      const res = await fetchWithTimeout(shopifyUrl, { headers: HEADERS }, 4000);
       if (res.ok) {
         const text = await res.text();
         if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
@@ -1164,7 +1223,7 @@ async function extractAndDownloadProduct(
     try {
       // 1. Fetch the product page HTML to extract __BOOTSTRAP_STATE__ and find the product ID
       let prodHtml = "";
-      const resHtml = await fetch(productUrl, { headers: HEADERS });
+      const resHtml = await fetchWithTimeout(productUrl, { headers: HEADERS }, 4000);
       if (resHtml.ok) {
         prodHtml = await resHtml.text();
         const $prod = cheerio.load(prodHtml);
@@ -1188,12 +1247,12 @@ async function extractAndDownloadProduct(
           
           if (classicUserID && classicSiteID && lastSegment && /^\d+$/.test(lastSegment)) {
             const prodApiUrl = `https://cdn5.editmysite.com/app/store/api/v28/editor/users/${classicUserID}/sites/${classicSiteID}/products/${lastSegment}?cache-version=${siteCatalogVersion}`;
-            const apiRes = await fetch(prodApiUrl, {
+            const apiRes = await fetchWithTimeout(prodApiUrl, {
               headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/json"
               }
-            });
+            }, 4000);
             
             if (apiRes.ok) {
               const apiData = await apiRes.json();
@@ -1245,7 +1304,7 @@ async function extractAndDownloadProduct(
   if (!shopifyJsonSucceeded && !weeblyJsonSucceeded) {
     let html = "";
     try {
-      const res = await fetch(productUrl, { headers: HEADERS });
+      const res = await fetchWithTimeout(productUrl, { headers: HEADERS }, 4000);
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -1449,6 +1508,7 @@ async function extractAndDownloadProduct(
   // Download candidate images
   let imgIndex = 1;
   for (const cand of normalizedCandidates) {
+    if (isJobCancelled(jobId)) return null;
     job.progress.currentStep = `Downloading image ${imgIndex} of ${normalizedCandidates.length} for ${productTitle}...`;
     saveJob(jobId, job);
 
@@ -1464,7 +1524,7 @@ async function extractAndDownloadProduct(
     const filename = `${cleanProdName}${variantSuffix} - ${String(imgIndex).padStart(2, '0')}${finalExtension}`;
 
     try {
-      const response = await fetch(cand.url, { headers: HEADERS });
+      const response = await fetchWithTimeout(cand.url, { headers: HEADERS }, 3500);
       if (!response.ok) {
         throw new Error(`HTTP Error ${response.status}`);
       }
@@ -1585,6 +1645,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
   let productIdx = 1;
   for (const dp of productsToProcess) {
+    if (isJobCancelled(jobId)) return;
     job.progress.currentProductIndex = productIdx;
     job.progress.currentProductName = dp.name;
     job.progress.currentStep = `Scanning product page for: ${dp.name}...`;
@@ -1597,6 +1658,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
     let imgIdx = 1;
     for (const imgSpec of dp.images) {
+      if (isJobCancelled(jobId)) return;
       job.progress.currentStep = `Downloading image ${imgIdx} of ${dp.images.length} for ${dp.name}...`;
       saveJob(jobId, job);
 
@@ -1608,7 +1670,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
       try {
         // Fetch real buffer from Unsplash to make the download ZIP completely functional and contain real JPEGs!
-        const res = await fetch(imgSpec.url);
+        const res = await fetchWithTimeout(imgSpec.url, {}, 3500);
         if (!res.ok) throw new Error("Fetch failed");
 
         const buffer = Buffer.from(await res.arrayBuffer());
@@ -1671,6 +1733,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
     saveJob(jobId, job);
   }
 
+  if (isJobCancelled(jobId)) return;
   // Set as completed
   job.status = "completed";
   job.progress.percent = 100;

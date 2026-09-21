@@ -24,7 +24,7 @@ export interface ExtractionJob {
   url: string;
   urls?: string[];
   mode: 'auto' | 'product' | 'collection';
-  status: 'idle' | 'analyzing' | 'extracting' | 'completed' | 'failed';
+  status: 'idle' | 'analyzing' | 'extracting' | 'completed' | 'failed' | 'cancelled';
   options: {
     includeGallery: boolean;
     includeVariants: boolean;

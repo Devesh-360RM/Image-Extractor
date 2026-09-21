@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import logoImage from "./assets/images/app_logo_icon_1789999735173.jpg";
 import { 
   motion, 
   AnimatePresence 
@@ -28,7 +29,8 @@ import {
   File,
   Globe,
   ArrowLeft,
-  Check
+  Check,
+  Loader2
 } from "lucide-react";
 import { ExtractionJob, ProductData, ImageMetadata } from "./types";
 
@@ -66,6 +68,7 @@ export default function App() {
   const [job, setJob] = useState<ExtractionJob | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
 
   // UI State
   const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
@@ -117,6 +120,10 @@ export default function App() {
         } else if (data.status === "failed") {
           if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
           setError(data.error || "Extraction failed on the server.");
+        } else if (data.status === "cancelled") {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setIsSubmitting(false);
+          setIsCancelling(false);
         }
       } catch (err: any) {
         console.error("Polling error:", err);
@@ -164,6 +171,8 @@ export default function App() {
         setJob(responseData.job);
         if (responseData.job.status === "completed" && responseData.job.products?.length > 0) {
           setExpandedProducts({ [responseData.job.products[0].id]: true });
+        } else if (responseData.job.status === "failed") {
+          setError(responseData.job.error || "Extraction failed.");
         }
       } else {
         // Initialize local layout progress state for asynchronous polling
@@ -439,12 +448,56 @@ export default function App() {
     window.location.href = `/api/jobs/${activeJobId}/download-image/${productId}/${imgId}`;
   };
 
+  // Cancel active scrape
+  const handleCancelScrape = async () => {
+    // 1. Immediately clear client polling
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+
+    const currentJobId = activeJobId;
+    setIsCancelling(true);
+    setIsSubmitting(false);
+
+    // 2. Call backend to stop crawler loops immediately
+    if (currentJobId) {
+      try {
+        await fetch(`/api/jobs/${currentJobId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        console.error("Failed to cancel job on server:", err);
+      }
+    }
+
+    // 3. Reset client state cleanly
+    setIsCancelling(false);
+    setJob(null);
+    setActiveJobId(null);
+    setUrl("");
+    setError("Scraping was cancelled.");
+    setTimeout(() => {
+      setError(null);
+    }, 3000);
+  };
+
   // Reset page
   const handleReset = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (activeJobId && (job?.status === "analyzing" || job?.status === "extracting")) {
+      fetch(`/api/jobs/${activeJobId}/cancel`, { method: "POST" }).catch(() => {});
+    }
     setUrl("");
     setJob(null);
     setActiveJobId(null);
     setError(null);
+    setIsSubmitting(false);
+    setIsCancelling(false);
     setExpandedProducts({});
     setPreviewImage(null);
   };
@@ -452,17 +505,19 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] font-sans antialiased selection:bg-indigo-100 selection:text-indigo-900 pb-20">
       {/* HEADER BAR */}
-      <header className="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-slate-200">
+      <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/80 shadow-2xs">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <img 
-              id="header-logo" 
-              src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
-              alt="" 
-              className="w-8 h-8 object-contain rounded-full border border-slate-200/80 bg-slate-50" 
-              referrerPolicy="no-referrer"
-            />
-            <span className="font-extrabold text-base sm:text-lg tracking-tight text-slate-900">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-full border border-slate-200 bg-slate-100/60 flex items-center justify-center flex-shrink-0 overflow-hidden">
+              <img 
+                id="header-logo" 
+                src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
+                alt="" 
+                className="w-full h-full object-contain" 
+                referrerPolicy="no-referrer"
+              />
+            </div>
+            <span className="font-extrabold text-[#0B132B] text-base sm:text-xl tracking-tight">
               360 RM : E-Commerce Image Extractor
             </span>
           </div>
@@ -1028,14 +1083,25 @@ export default function App() {
                 </div>
               )}
 
-              <div className="border-t border-slate-100 pt-5">
+              <div className="border-t border-slate-100 pt-5 flex items-center justify-between">
                 <button
                   type="button"
-                  onClick={handleReset}
-                  className="px-4 py-2 text-xs font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors cursor-pointer"
+                  onClick={handleCancelScrape}
+                  disabled={isCancelling}
+                  className="px-4 py-2 text-xs font-semibold text-rose-600 hover:text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  Cancel Scrape
+                  {isCancelling ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-rose-600" />
+                      <span>Cancelling scrape...</span>
+                    </>
+                  ) : (
+                    <span>Cancel Scrape</span>
+                  )}
                 </button>
+                <span className="text-[11px] text-slate-400">
+                  Stops backend extraction and discards in-flight requests
+                </span>
               </div>
             </motion.div>
           )}
