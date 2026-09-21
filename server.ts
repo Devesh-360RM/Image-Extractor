@@ -18,6 +18,16 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// Normalize URL paths for Vercel Serverless Function routing
+app.use((req, res, next) => {
+  if (process.env.VERCEL) {
+    if (!req.url.startsWith("/api") && !req.url.startsWith("/api/")) {
+      req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+    }
+  }
+  next();
+});
+
 // In-memory + /tmp file-backed job state (resilient across serverless lambda restarts)
 const jobs = new Map<string, ExtractionJob>();
 const imageBuffers = new Map<string, Buffer>(); // key: `${jobId}_${productId}_${imageId}`
