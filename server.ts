@@ -1,17 +1,19 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import * as cheerio from "cheerio";
 import JSZip from "jszip";
-import { fileURLToPath } from "url";
 import multer from "multer";
 import * as XLSX from "xlsx";
 import { ExtractionJob, ProductData, ImageMetadata } from "./src/types";
-
-// Setup __dirname for ES Modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import {
+  normalizeProtocol,
+  getShopifyHighResImageUrl,
+  parseShopifyProductUrl,
+  extractShopifyImages,
+  extractProductFromUrl
+} from "./src/lib/extractorEngine";
+import { detectPlatform } from "./src/lib/platforms";
 
 const app = express();
 const PORT = 3000;
@@ -852,18 +854,10 @@ async function runCrawler(jobId: string) {
 
     // 2. Parse HTML and detect platform
     const $ = cheerio.load(mainHtml);
-    let platform = "generic";
-    if (mainHtml.includes("cdn.shopify.com") || mainHtml.includes("window.Shopify")) {
-      platform = "shopify";
-    } else if (mainHtml.includes("/wp-content/") || mainHtml.includes("woocommerce")) {
-      platform = "woocommerce";
-    } else if (mainHtml.includes("magento")) {
-      platform = "magento";
-    } else if (mainHtml.includes("bigcommerce")) {
-      platform = "bigcommerce";
-    } else if (mainHtml.includes("window.__BOOTSTRAP_STATE__") || mainHtml.includes("editmysite.com")) {
-      platform = "weebly";
-    }
+    const detection = detectPlatform(urlStr, mainHtml, $);
+    const platform = detection.platform;
+    job.detectedPlatform = detection.platform;
+    job.confidenceScore = detection.confidence;
 
     // 3. Determine URL Mode (Product vs Listing)
     let detectedMode: "product" | "collection" = "product";
@@ -885,7 +879,7 @@ async function runCrawler(jobId: string) {
       detectedMode = job.mode as any;
     }
 
-    job.progress.currentStep = `Detected platform: ${platform.toUpperCase()}. Mode: ${detectedMode === "product" ? "Single Product Page" : "Product Listing / Collection"}`;
+    job.progress.currentStep = `Detected: ${detection.platform} (${Math.round(detection.confidence * 100)}% confidence). Mode: ${detectedMode === "product" ? "Single Product Page" : "Collection"}`;
     job.progress.percent = 20;
     saveJob(jobId, job);
 
@@ -896,7 +890,7 @@ async function runCrawler(jobId: string) {
       job.progress.currentStep = "Searching for product cards...";
       saveJob(jobId, job);
 
-      if (platform === "shopify") {
+      if (platform === "Shopify") {
         // Shopify collection JSON extraction trick is incredibly clean!
         try {
           const urlObj = new URL(urlStr);
@@ -930,7 +924,7 @@ async function runCrawler(jobId: string) {
         } catch (shopifyErr) {
           console.error("Shopify Collection API fallback:", shopifyErr);
         }
-      } else if (platform === "weebly") {
+      } else if (platform === "Square Online") {
         // Weebly / Square Online JSON API extraction
         try {
           const bootstrapMatch = mainHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*({.*?});/s) || mainHtml.match(/window\.__BOOTSTRAP_STATE__\s*=\s*(.*?);/);
@@ -1001,7 +995,7 @@ async function runCrawler(jobId: string) {
               absUrlObj.pathname.includes("/products/") || 
               absUrlObj.pathname.includes("/product/") || 
               absUrlObj.pathname.includes("/item/") || 
-              (absUrlObj.pathname.split("/").filter(Boolean).length >= 2 && platform === "shopify");
+              (absUrlObj.pathname.split("/").filter(Boolean).length >= 2 && platform === "Shopify");
 
             if (isProductPattern && !uniqueLinks.has(absUrl) && absUrl !== urlStr) {
               uniqueLinks.add(absUrl);
@@ -1170,51 +1164,36 @@ async function extractAndDownloadProduct(
   let imageCandidates: { url: string; variant?: string; type: string }[] = [];
   let variants: string[] = [];
 
-  // If Shopify, try JS endpoint first (most reliable!)
+  // 3. For Shopify product URLs, remove query parameters and fetch {origin}/products/{handle}.js
   let shopifyJsonSucceeded = false;
-  if (platform === "shopify") {
+  const shopifyInfo = parseShopifyProductUrl(productUrl);
+
+  if (shopifyInfo.isShopifyProduct && shopifyInfo.jsonUrl) {
     try {
-      const shopifyUrl = productUrl.split("?")[0] + ".js";
-      const res = await fetchWithTimeout(shopifyUrl, { headers: HEADERS }, 4000);
+      const res = await fetchWithTimeout(shopifyInfo.jsonUrl, { headers: HEADERS }, 4000);
       if (res.ok) {
         const text = await res.text();
         if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
           const data = JSON.parse(text);
-          productTitle = data.title || productTitle;
-          
-          // Extract images and variants
-          if (Array.isArray(data.images)) {
-            data.images.forEach((imgUrl: string) => {
+          if (data && (data.title || data.images || data.featured_image)) {
+            const extracted = extractShopifyImages(data, productUrl);
+            productTitle = extracted.name || productTitle;
+            variants = extracted.variants;
+            for (const img of extracted.images) {
               imageCandidates.push({
-                url: imgUrl,
-                type: "Gallery",
-                variant: "General"
+                url: img.url,
+                type: img.type,
+                variant: img.variant
               });
-            });
+            }
+            shopifyJsonSucceeded = true;
           }
-
-          // Associate variants
-          if (Array.isArray(data.variants)) {
-            data.variants.forEach((v: any) => {
-              if (v.title && v.title !== "Default Title") {
-                variants.push(v.title);
-              }
-              if (v.featured_image && v.featured_image.src) {
-                imageCandidates.push({
-                  url: v.featured_image.src,
-                  type: "Variant",
-                  variant: v.title
-                });
-              }
-            });
-          }
-          shopifyJsonSucceeded = true;
         } else {
-          console.log(`Shopify JS response for ${shopifyUrl} was HTML/invalid JSON, falling back to HTML parser.`);
+          console.log(`Shopify JS response for ${shopifyInfo.jsonUrl} was HTML/invalid JSON, falling back to HTML parser.`);
         }
       }
     } catch (e) {
-      console.log("Could not fetch Shopify JS endpoint, falling back to HTML parser.");
+      console.log(`Could not fetch Shopify JS endpoint (${shopifyInfo.jsonUrl}), falling back to HTML parser.`);
     }
   }
 
@@ -1760,6 +1739,7 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     console.log("Configuring Vite Development Middleware...");
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",

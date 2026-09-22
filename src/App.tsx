@@ -623,11 +623,20 @@ export default function App() {
                         id="url-input"
                         type="url"
                         required
-                        placeholder="Paste Shopify, WooCommerce, or any store URL..."
+                        placeholder="Paste Shopify, WooCommerce, Square, BigCommerce, Wix, Squarespace, Magento, or custom store URL..."
                         value={url}
                         onChange={(e) => setUrl(e.target.value)}
                         className="block w-full pl-11 pr-4 py-3.5 text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-4 focus:ring-indigo-100 focus:border-indigo-500 transition-all text-sm outline-none"
                       />
+                    </div>
+                    {/* SUPPORTED PLATFORMS PILLS */}
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[11px] text-slate-500">
+                      <span className="font-semibold text-slate-600">Supported:</span>
+                      {["Shopify", "WooCommerce", "WordPress", "Square", "BigCommerce", "Wix", "Squarespace", "Magento", "PrestaShop", "Shopware", "Webflow", "Shift4Shop", "Clover", "Custom"].map((p) => (
+                        <span key={p} className="px-2 py-0.5 bg-slate-100 text-slate-700 rounded-md font-medium">
+                          {p}
+                        </span>
+                      ))}
                     </div>
                   </div>
 
@@ -1139,12 +1148,41 @@ export default function App() {
                       <CheckCircle2 className="w-5.5 h-5.5" />
                     </div>
                     <div>
-                      <h3 className="font-extrabold text-lg text-slate-950">
-                        Extraction Complete!
-                      </h3>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="font-extrabold text-lg text-slate-950">
+                          Extraction Complete!
+                        </h3>
+                        {job.detectedPlatform && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                            {job.detectedPlatform}
+                            {job.confidenceScore && (
+                              <span className="text-[10px] opacity-75">
+                                ({Math.round(job.confidenceScore * 100)}%)
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </div>
                       <p className="text-xs text-slate-500">
                         Processed: <span className="font-semibold text-slate-700">{job.url}</span>
                       </p>
+                      {job.collectionStats && (
+                        <div className="flex items-center gap-3 mt-1.5 text-[11px] font-medium text-slate-600">
+                          <span className="text-emerald-600 font-bold">
+                            ✓ {job.collectionStats.successful} Succeeded
+                          </span>
+                          {job.collectionStats.failed > 0 && (
+                            <span className="text-rose-600 font-bold">
+                              ✗ {job.collectionStats.failed} Failed
+                            </span>
+                          )}
+                          {job.collectionStats.skipped > 0 && (
+                            <span className="text-slate-500">
+                              • {job.collectionStats.skipped} Skipped
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   

@@ -17,6 +17,14 @@ export interface ProductData {
   url: string;
   images: ImageMetadata[];
   variants: string[];
+  platform?: string;
+  confidence?: number;
+}
+
+export interface CollectionStats {
+  successful: number;
+  failed: number;
+  skipped: number;
 }
 
 export interface ExtractionJob {
@@ -25,6 +33,9 @@ export interface ExtractionJob {
   urls?: string[];
   mode: 'auto' | 'product' | 'collection';
   status: 'idle' | 'analyzing' | 'extracting' | 'completed' | 'failed' | 'cancelled';
+  detectedPlatform?: string;
+  confidenceScore?: number;
+  collectionStats?: CollectionStats;
   options: {
     includeGallery: boolean;
     includeVariants: boolean;
