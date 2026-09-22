@@ -59,7 +59,7 @@ export default function App() {
   // Scraper Options
   const [includeGallery, setIncludeGallery] = useState(true);
   const [includeVariants, setIncludeVariants] = useState(true);
-  const [useHighestResolution, setUseHighestResolution] = useState(true);
+  const useHighestResolution = true; // Always active
   const [removeDuplicates, setRemoveDuplicates] = useState(true);
   const [includeStyleSiblings, setIncludeStyleSiblings] = useState(false);
 
@@ -696,22 +696,17 @@ export default function App() {
                         </div>
                       </div>
 
-                      <label className="flex items-start gap-3 p-3 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer group">
-                        <input
-                          type="checkbox"
-                          checked={useHighestResolution}
-                          onChange={(e) => setUseHighestResolution(e.target.checked)}
-                          className="mt-0.5 w-4.5 h-4.5 rounded text-indigo-600 border-slate-300 focus:ring-indigo-500 transition-all accent-indigo-600"
-                        />
+                      <div className="flex items-start gap-3 p-3 rounded-lg bg-emerald-50/55 border border-emerald-100/50">
+                        <div className="mt-0.5 w-4.5 h-4.5 rounded bg-emerald-100 flex items-center justify-center text-emerald-700 text-[10px] font-bold">✓</div>
                         <div>
-                          <span className="text-xs font-semibold text-slate-800 group-hover:text-slate-900">
-                            Use Highest Quality
+                          <span className="text-xs font-bold text-slate-800">
+                            Use Highest Quality (Active)
                           </span>
-                          <p className="text-[10px] text-slate-500">
+                          <p className="text-[10px] text-slate-600 mt-0.5">
                             Extract highest available resolution master assets from CDN
                           </p>
                         </div>
-                      </label>
+                      </div>
 
                       <label className="flex items-start gap-3 p-3 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer group">
                         <input
