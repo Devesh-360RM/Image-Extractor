@@ -1,7 +1,7 @@
 import {
   extractProductFromUrl,
   extractCollectionFromUrl
-} from "../src/lib/extractorEngine.ts";
+} from "../src/lib/extractorEngine.js";
 
 export default async function handler(req: any, res: any) {
   // CORS & Options pre-flight

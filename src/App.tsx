@@ -29,6 +29,7 @@ import {
   File,
   Globe,
   ArrowLeft,
+  ArrowRight,
   Check,
   Loader2,
   Store,
@@ -106,9 +107,17 @@ export default function App() {
   // Job Tracking
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [job, setJob] = useState<ExtractionJob | null>(null);
+  const [cachedLastJob, setCachedLastJob] = useState<ExtractionJob | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+
+  // Sync cachedLastJob with latest completed job
+  useEffect(() => {
+    if (job && job.status === "completed" && job.products?.length > 0) {
+      setCachedLastJob(job);
+    }
+  }, [job]);
 
   // UI State
   const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
@@ -576,6 +585,25 @@ export default function App() {
     }, 3000);
   };
 
+  // Go back to extractor while preserving completed job state
+  const handleGoBackToExtractor = () => {
+    if (job && job.status === "completed") {
+      setCachedLastJob(job);
+    }
+    setJob(null);
+  };
+
+  // Go forward to last completed results
+  const handleGoForwardToResults = () => {
+    if (cachedLastJob) {
+      setJob(cachedLastJob);
+      setActiveJobId(cachedLastJob.jobId);
+      if (cachedLastJob.products && cachedLastJob.products.length > 0) {
+        setExpandedProducts({ [cachedLastJob.products[0].id]: true });
+      }
+    }
+  };
+
   // Reset page
   const handleReset = () => {
     if (pollIntervalRef.current) {
@@ -604,8 +632,8 @@ export default function App() {
             <div className="w-8 h-8 rounded-full border border-slate-200 bg-slate-100/60 flex items-center justify-center flex-shrink-0 overflow-hidden">
               <img 
                 id="header-logo" 
-                src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" 
-                alt="" 
+                src={logoImage} 
+                alt="App Logo" 
                 className="w-full h-full object-contain" 
                 referrerPolicy="no-referrer"
               />
@@ -615,11 +643,58 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center gap-4">
+            {cachedLastJob && !job && (
+              <button
+                type="button"
+                onClick={handleGoForwardToResults}
+                className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs uppercase tracking-wider rounded-lg shadow-xs transition-all flex items-center gap-1.5 cursor-pointer active:scale-98"
+              >
+                <span>Go Forward to Last Page</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
       </header>
 
       <main className="max-w-4xl mx-auto px-4 pt-10">
+        
+        {/* GO FORWARD NOTIFICATION BANNER IF ACCIDENTALLY WENT BACK */}
+        {cachedLastJob && !job && (
+          <div className="mb-6 bg-gradient-to-r from-indigo-50 via-purple-50 to-indigo-50 border border-indigo-200/90 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-sm">
+            <div className="flex items-center gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold flex-shrink-0 shadow-xs">
+                <Layers className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-indigo-700 bg-indigo-100/80 px-2 py-0.5 rounded-md">
+                    Session Saved
+                  </span>
+                  <span className="text-xs text-slate-500 font-medium">
+                    Store: {cachedLastJob.storeName || "Extracted Store"}
+                  </span>
+                </div>
+                <p className="text-sm font-bold text-slate-900 mt-0.5">
+                  Your last scraped results are saved
+                </p>
+                <p className="text-xs text-slate-600">
+                  {cachedLastJob.products?.length || 0} product(s) with {cachedLastJob.products?.reduce((acc, p) => acc + (p.images?.length || 0), 0) || 0} images ready to view and download.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={handleGoForwardToResults}
+                className="w-full sm:w-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs tracking-wider uppercase rounded-xl shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+              >
+                <span>Go Forward to Last Page</span>
+                <ArrowRight className="w-4.5 h-4.5" />
+              </button>
+            </div>
+          </div>
+        )}
         
         {/* DEMO PLAYGROUND ANNOUNCEMENT */}
         {showDemoBanner && !job && (
@@ -1311,14 +1386,25 @@ export default function App() {
             >
               {/* TOP ACTION BAR */}
               <div className="flex flex-col sm:flex-row items-center justify-between gap-4 bg-slate-50 border border-slate-200/60 p-4 rounded-2xl shadow-xs">
-                <button
-                  type="button"
-                  onClick={handleReset}
-                  className="w-full sm:w-auto px-5 py-2.5 bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 text-slate-700 font-extrabold text-xs tracking-wider uppercase rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-98"
-                >
-                  <ArrowLeft className="w-4.5 h-4.5 text-slate-500" />
-                  Go Back to Extractor
-                </button>
+                <div className="flex items-center gap-2.5 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={handleGoBackToExtractor}
+                    className="flex-1 sm:flex-initial px-5 py-2.5 bg-white hover:bg-slate-50 border border-slate-200 hover:border-slate-300 text-slate-700 font-extrabold text-xs tracking-wider uppercase rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+                  >
+                    <ArrowLeft className="w-4.5 h-4.5 text-slate-500" />
+                    Go Back to Extractor
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleReset}
+                    className="px-4 py-2.5 bg-white hover:bg-rose-50 border border-slate-200 hover:border-rose-200 text-slate-500 hover:text-rose-600 font-bold text-xs tracking-wider uppercase rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-98"
+                    title="Clear results and start completely fresh"
+                  >
+                    <X className="w-4 h-4 text-slate-400" />
+                    <span className="hidden sm:inline">Start Fresh</span>
+                  </button>
+                </div>
                 <div className="flex items-center gap-3 w-full sm:w-auto">
                   <button
                     type="button"

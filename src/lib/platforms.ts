@@ -1,25 +1,25 @@
 import * as cheerio from "cheerio";
 
 export type SupportedPlatform =
-  | "./shopify.ts"
-  | "./WooCommerce.ts"
-  | "./WordPress.ts"
-  | "./Square Online.ts"
-  | "./Lightspeed eCom.ts"
-  | "./Ecwid.ts"
-  | "./BigCommerce.ts"
-  | "./Wix Stores.ts"
-  | "./Squarespace Commerce.ts"
-  | "./Magento / Adobe Commerce.ts"
-  | "./PrestaShop.ts"
-  | "./Shopware.ts"
-  | "./Webflow Ecommerce.ts"
-  | "./Shift4Shop.ts"
-  | "./Clover.ts"
-  | "./GoDaddy Online Store.ts"
-  | "./Volusion.ts"
-  | "./Salesforce Commerce Cloud.ts"
-  | "./Custom E-Commerce.ts";
+  | "Shopify"
+  | "WooCommerce"
+  | "WordPress"
+  | "Square Online"
+  | "Lightspeed eCom"
+  | "Ecwid"
+  | "BigCommerce"
+  | "Wix Stores"
+  | "Squarespace Commerce"
+  | "Magento / Adobe Commerce"
+  | "PrestaShop"
+  | "Shopware"
+  | "Webflow Ecommerce"
+  | "Shift4Shop"
+  | "Clover"
+  | "GoDaddy Online Store"
+  | "Volusion"
+  | "Salesforce Commerce Cloud"
+  | "Custom E-Commerce";
 
 export interface DetectionResult {
   platform: SupportedPlatform;

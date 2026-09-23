@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild src/lib/extractorEngine.ts --bundle --platform=node --format=esm --packages=external --outfile=src/lib/extractorEngine.js && esbuild src/lib/platforms.ts --bundle --platform=node --format=esm --packages=external --outfile=src/lib/platforms.js && esbuild src/lib/security.ts --bundle --platform=node --format=esm --packages=external --outfile=src/lib/security.js && esbuild api/extract.ts --bundle --platform=node --format=esm --packages=external --outfile=api/extract.js && esbuild api/index.ts --bundle --platform=node --format=esm --packages=external --outfile=api/index.js && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
