@@ -51,6 +51,7 @@ export default async function handler(req: any, res: any) {
       const formattedProducts = collectionResult.products.map((prod) => ({
         id: prod.id,
         name: prod.name,
+        storeName: prod.storeName,
         url: prod.url,
         variants: prod.variants,
         platform: prod.platform,
@@ -71,6 +72,7 @@ export default async function handler(req: any, res: any) {
       const formattedJob = {
         jobId,
         url: targetUrl,
+        storeName: formattedProducts[0]?.storeName,
         mode: "collection",
         status: "completed",
         detectedPlatform: collectionResult.platform,
@@ -122,6 +124,7 @@ export default async function handler(req: any, res: any) {
         const formattedProducts = collFallback.products.map((prod) => ({
           id: prod.id,
           name: prod.name,
+          storeName: prod.storeName,
           url: prod.url,
           variants: prod.variants,
           platform: prod.platform,
@@ -145,6 +148,7 @@ export default async function handler(req: any, res: any) {
           job: {
             jobId,
             url: targetUrl,
+            storeName: formattedProducts[0]?.storeName,
             mode: "collection",
             status: "completed",
             detectedPlatform: collFallback.platform,
@@ -187,6 +191,7 @@ export default async function handler(req: any, res: any) {
     const formattedJob = {
       jobId,
       url: targetUrl,
+      storeName: prod.storeName,
       mode: body.mode || "product",
       status: "completed",
       detectedPlatform: result.platform,
@@ -213,6 +218,7 @@ export default async function handler(req: any, res: any) {
         {
           id: prod.id,
           name: prod.name,
+          storeName: prod.storeName,
           url: prod.url,
           platform: prod.platform,
           confidence: prod.confidence,

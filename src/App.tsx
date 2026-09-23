@@ -30,7 +30,9 @@ import {
   Globe,
   ArrowLeft,
   Check,
-  Loader2
+  Loader2,
+  Store,
+  Building2
 } from "lucide-react";
 import { ExtractionJob, ProductData, ImageMetadata } from "./types";
 
@@ -49,6 +51,44 @@ async function safeParseJsonResponse<T = any>(res: Response): Promise<T> {
   const summary = cleanText.length > 200 ? cleanText.substring(0, 200) + "..." : cleanText;
   
   throw new Error(summary || `Request failed with status ${res.status}`);
+}
+
+export function getPOSDisplayName(platform?: string, url?: string): string {
+  const norm = (platform || "").toLowerCase();
+  if (norm.includes("lightspeed") || norm.includes("webshopapp") || norm.includes("seoshop")) return "Lightspeed";
+  if (norm.includes("ecwid")) return "Ecwid";
+  if (norm.includes("shopify")) return "Shopify";
+  if (norm.includes("square") || norm.includes("weebly")) return "Square Online";
+  if (norm.includes("woocommerce") || norm.includes("wordpress")) return "WooCommerce";
+  if (norm.includes("magento")) return "Magento";
+  if (norm.includes("bigcommerce")) return "BigCommerce";
+  if (norm.includes("wix")) return "Wix";
+  if (norm.includes("squarespace")) return "Squarespace";
+  if (norm.includes("prestashop")) return "PrestaShop";
+  if (norm.includes("shopware")) return "Shopware";
+  if (norm.includes("webflow")) return "Webflow";
+  if (norm.includes("shift4shop")) return "Shift4Shop";
+  if (norm.includes("clover")) return "Clover";
+
+  if (url) {
+    const u = url.toLowerCase();
+    if (u.includes("lightspeed") || u.includes("webshopapp") || u.includes("seoshop") || u.includes("shoplightspeed")) return "Lightspeed";
+    if (u.includes("ecwid") || u.includes("company.site")) return "Ecwid";
+    if (u.includes("shopify") || u.includes("myshopify")) return "Shopify";
+    if (u.includes("square") || u.includes("squareup") || u.includes("square.site")) return "Square Online";
+    if (u.includes("bigcommerce") || u.includes("mybigcommerce")) return "BigCommerce";
+    if (u.includes("wix")) return "Wix";
+    if (u.includes("squarespace")) return "Squarespace";
+    if (u.includes("woocommerce") || u.includes("wp-content")) return "WooCommerce";
+    if (u.includes("magento")) return "Magento";
+    if (u.includes("clover")) return "Clover";
+  }
+
+  if (platform && platform !== "POS" && platform !== "Unknown" && platform !== "generic" && platform !== "Generic" && platform !== "Custom E-Commerce") {
+    return platform;
+  }
+
+  return "Shopify";
 }
 
 export default function App() {
@@ -76,7 +116,9 @@ export default function App() {
   const [showDemoBanner, setShowDemoBanner] = useState(true);
 
   // File Upload State
-  const [activeTab, setActiveTab] = useState<"url" | "file">("url");
+  const [activeTab, setActiveTab] = useState<"url" | "file" | "html">("url");
+  const [pastedHtml, setPastedHtml] = useState("");
+  const [pastedUrl, setPastedUrl] = useState("");
   const [fileExtractionMode, setFileExtractionMode] = useState<"auto" | "product" | "collection">("auto");
   const [fileParsingState, setFileParsingState] = useState<{
     isLoading: boolean;
@@ -206,6 +248,45 @@ export default function App() {
     }
   };
 
+  const handleExtractFromHtml = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!pastedHtml.trim()) {
+      setError("Please paste the page HTML source code.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError(null);
+    setJob(null);
+    setActiveJobId(null);
+
+    try {
+      const res = await fetch("/api/extract-html", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          html: pastedHtml.trim(),
+          url: pastedUrl.trim() || url.trim() || "https://paige.com/products/men-lennox-emberton-1"
+        })
+      });
+
+      const responseData = await safeParseJsonResponse<{ jobId: string; job?: ExtractionJob }>(res);
+      const jobId = responseData.jobId;
+      setActiveJobId(jobId);
+
+      if (responseData.job) {
+        setJob(responseData.job);
+        if (responseData.job.status === "completed" && responseData.job.products?.length > 0) {
+          setExpandedProducts({ [responseData.job.products[0].id]: true });
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to extract images from pasted HTML.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const processFile = async (file: File) => {
     if (!file) return;
     
@@ -278,11 +359,13 @@ export default function App() {
     setUrl(selectedUrl.trim());
 
     try {
+      const currentFileName = fileParsingState.result?.filename || undefined;
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: selectedUrl.trim(),
+          fileName: currentFileName,
           mode: fileExtractionMode,
           options: {
             includeGallery,
@@ -308,6 +391,7 @@ export default function App() {
         setJob({
           jobId,
           url: selectedUrl.trim(),
+          fileName: currentFileName,
           mode: fileExtractionMode,
           status: "analyzing",
           options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
@@ -347,11 +431,13 @@ export default function App() {
     setUrl(`Bulk Scrape: ${selectedUrls.length} links`);
 
     try {
+      const currentFileName = fileParsingState.result?.filename || undefined;
       const res = await fetch("/api/extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           urls: selectedUrls,
+          fileName: currentFileName,
           mode: fileExtractionMode,
           options: {
             includeGallery,
@@ -378,6 +464,7 @@ export default function App() {
           jobId,
           url: `Bulk Scrape: ${selectedUrls.length} links`,
           urls: selectedUrls,
+          fileName: currentFileName,
           mode: fileExtractionMode,
           status: "analyzing",
           options: { includeGallery, includeVariants, useHighestResolution, removeDuplicates, includeStyleSiblings },
@@ -440,6 +527,12 @@ export default function App() {
   const handleDownloadZIP = () => {
     if (!activeJobId) return;
     window.location.href = `/api/jobs/${activeJobId}/download-zip`;
+  };
+
+  // Helper: Trigger single product folder ZIP download
+  const handleDownloadProductFolder = (productId: string) => {
+    if (!activeJobId) return;
+    window.location.href = `/api/jobs/${activeJobId}/products/${productId}/download-zip`;
   };
 
   // Helper: Trigger single image download
@@ -603,7 +696,19 @@ export default function App() {
                   }`}
                 >
                   <FileUp className="w-4 h-4" />
-                  Extract from File (PDF/CSV/XLSX)
+                  Extract from File (PDF/CSV)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("html")}
+                  className={`flex-1 flex items-center justify-center gap-2 py-3.5 text-xs font-bold uppercase tracking-wider transition-all rounded-lg cursor-pointer ${
+                    activeTab === "html"
+                      ? "bg-white text-indigo-600 shadow-sm border border-slate-200/55 font-extrabold"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-slate-100/50"
+                  }`}
+                >
+                  <FileText className="w-4 h-4" />
+                  Paste HTML Source
                 </button>
               </div>
 
@@ -775,11 +880,31 @@ export default function App() {
 
                   {/* ERROR FEEDBACK */}
                   {error && (
-                    <div className="p-4 bg-rose-50 border border-rose-100 rounded-xl flex items-start gap-3 text-rose-800">
-                      <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-rose-500" />
-                      <div className="text-xs">
-                        <span className="font-bold">Extraction Error:</span> {error}
+                    <div className="p-4 bg-rose-50 border border-rose-100 rounded-xl flex flex-col gap-2.5 text-rose-800">
+                      <div className="flex items-start gap-3">
+                        <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-rose-500" />
+                        <div className="text-xs">
+                          <span className="font-bold">Extraction Error:</span> {error}
+                        </div>
                       </div>
+                      {(error.includes("Vercel") || error.includes("Cloudflare") || error.includes("Checkpoint") || error.includes("429")) && (
+                        <div className="mt-1 pt-2.5 border-t border-rose-200/60 flex flex-wrap items-center justify-between gap-3">
+                          <span className="text-[11px] text-rose-700 font-medium">
+                            💡 WAF Security Checkpoint detected. Click below to paste the product page HTML source code directly!
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPastedUrl(url);
+                              setActiveTab("html");
+                              setError(null);
+                            }}
+                            className="px-3.5 py-1.5 text-xs font-bold bg-white text-rose-700 border border-rose-200 hover:bg-rose-100/80 rounded-lg shadow-xs transition-all cursor-pointer"
+                          >
+                            Paste Page HTML Source
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -802,7 +927,7 @@ export default function App() {
                     )}
                   </button>
                 </form>
-              ) : (
+              ) : activeTab === "file" ? (
                 <div className="p-6 sm:p-8 space-y-6">
                   {/* File Upload Zone */}
                   <div
@@ -1000,6 +1125,65 @@ export default function App() {
                     </div>
                   )}
                 </div>
+              ) : (
+                <form onSubmit={handleExtractFromHtml} className="p-6 sm:p-8 space-y-6">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                      Product Page URL (Optional Reference)
+                    </label>
+                    <input
+                      type="url"
+                      placeholder="https://paige.com/products/men-lennox-emberton-1"
+                      value={pastedUrl}
+                      onChange={(e) => setPastedUrl(e.target.value)}
+                      className="block w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-4 focus:ring-indigo-100 focus:border-indigo-500 transition-all outline-none"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                      Paste Product Page HTML Source Code
+                    </label>
+                    <p className="text-xs text-slate-500">
+                      On the product page, press <strong>Ctrl+U</strong> (or <strong>Cmd+Option+U</strong> on Mac) to view page source, select all (<strong>Ctrl+A</strong>), copy and paste here.
+                    </p>
+                    <textarea
+                      required
+                      rows={10}
+                      placeholder="<!DOCTYPE html><html><head>... Paste complete product page HTML source code here ...</html>"
+                      value={pastedHtml}
+                      onChange={(e) => setPastedHtml(e.target.value)}
+                      className="block w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:bg-white focus:ring-4 focus:ring-indigo-100 focus:border-indigo-500 transition-all outline-none"
+                    />
+                  </div>
+
+                  {error && (
+                    <div className="p-4 bg-rose-50 border border-rose-100 rounded-xl flex items-start gap-3 text-rose-800">
+                      <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-rose-500" />
+                      <div className="text-xs">
+                        <span className="font-bold">Extraction Error:</span> {error}
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white font-bold py-3.5 px-6 rounded-xl shadow-md shadow-indigo-100 hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer text-sm"
+                  >
+                    {isSubmitting ? (
+                      <>
+                        <RefreshCw className="w-4.5 h-4.5 animate-spin" />
+                        Parsing HTML & Extracting Images...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4.5 h-4.5" />
+                        EXTRACT IMAGES FROM HTML SOURCE
+                      </>
+                    )}
+                  </button>
+                </form>
               )}
             </motion.div>
           )}
@@ -1081,11 +1265,19 @@ export default function App() {
                 </div>
               </div>
 
-              {job.progress.currentProductName && (
-                <div className="text-xs text-indigo-700 bg-indigo-50 py-2 px-3.5 rounded-lg inline-block font-semibold">
-                  Current target: <span className="font-bold">{job.progress.currentProductName}</span>
-                </div>
-              )}
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                {job.storeName && (
+                  <div className="text-xs text-amber-900 bg-amber-50 border border-amber-200/80 py-1.5 px-3.5 rounded-lg inline-flex items-center gap-1.5 font-bold shadow-xs">
+                    <Building2 className="w-3.5 h-3.5 text-amber-600" />
+                    Company: <span className="font-extrabold text-amber-950">{job.storeName}</span>
+                  </div>
+                )}
+                {job.progress.currentProductName && (
+                  <div className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 py-1.5 px-3.5 rounded-lg inline-flex items-center gap-1.5 font-semibold">
+                    Current target: <span className="font-bold">{job.progress.currentProductName}</span>
+                  </div>
+                )}
+              </div>
 
               <div className="border-t border-slate-100 pt-5 flex items-center justify-between">
                 <button
@@ -1152,20 +1344,53 @@ export default function App() {
                         <h3 className="font-extrabold text-lg text-slate-950">
                           Extraction Complete!
                         </h3>
-                        {job.detectedPlatform && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
-                            {job.detectedPlatform}
-                            {job.confidenceScore && (
-                              <span className="text-[10px] opacity-75">
-                                ({Math.round(job.confidenceScore * 100)}%)
+                        {job.fileName ? (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-900 border border-indigo-200/90 shadow-xs">
+                            <FileSpreadsheet className="w-3.5 h-3.5 text-indigo-600" />
+                            <span className="font-black text-indigo-950">{job.fileName}</span>
+                          </span>
+                        ) : (
+                          <>
+                            {(job.storeName || job.products[0]?.storeName) && (
+                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-900 border border-amber-200/90 shadow-xs">
+                                <Building2 className="w-3.5 h-3.5 text-amber-600" />
+                                Company: <span className="font-black text-amber-950">{job.storeName || job.products[0]?.storeName}</span>
                               </span>
                             )}
-                          </span>
+                            {(job.detectedPlatform || job.products[0]?.platform) && (
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                {getPOSDisplayName(job.detectedPlatform || job.products[0]?.platform, job.url)}
+                              </span>
+                            )}
+                          </>
                         )}
                       </div>
-                      <p className="text-xs text-slate-500">
-                        Processed: <span className="font-semibold text-slate-700">{job.url}</span>
-                      </p>
+                      {job.fileName ? (
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-xs text-slate-500">
+                          <span>
+                            Source File: <span className="font-semibold text-slate-700">{job.fileName}</span>
+                          </span>
+                          <span>•</span>
+                          <span>
+                            Processed: <span className="font-semibold text-slate-700">{job.products.length} {job.products.length === 1 ? 'store link' : 'store links'}</span>
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-xs text-slate-500">
+                          {(job.storeName || job.products[0]?.storeName) && (
+                            <>
+                              <span className="font-bold text-slate-800 flex items-center gap-1">
+                                <Store className="w-3.5 h-3.5 text-amber-600 inline" />
+                                Store Name: <span className="text-amber-950 font-extrabold">{job.storeName || job.products[0]?.storeName}</span>
+                              </span>
+                              <span>•</span>
+                            </>
+                          )}
+                          <span>
+                            Processed: <span className="font-semibold text-slate-700 break-all">{job.url}</span>
+                          </span>
+                        </div>
+                      )}
                       {job.collectionStats && (
                         <div className="flex items-center gap-3 mt-1.5 text-[11px] font-medium text-slate-600">
                           <span className="text-emerald-600 font-bold">
@@ -1266,24 +1491,35 @@ export default function App() {
                 </div>
 
                 {/* CSV DOWNLOAD ROW */}
-                <div className="flex items-center justify-between p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 bg-slate-50 border border-slate-200 rounded-xl gap-3">
                   <div className="flex items-center gap-2.5">
-                    <FileSpreadsheet className="w-5 h-5 text-emerald-600" />
+                    <FileSpreadsheet className="w-5 h-5 text-emerald-600 shrink-0" />
                     <div>
                       <span className="text-xs font-bold text-slate-800 block">
                         product_data.csv
                       </span>
                       <span className="text-[10px] text-slate-500 block">
-                        Fully mapped CSV including Product Title, Variant, CDN URL, Image Type and File Name references.
+                        Fully mapped CSV including Product Title, Variant, CDN URL, Image Type and File Name references. (Also included inside ZIP)
                       </span>
                     </div>
                   </div>
-                  <button
-                    onClick={handleDownloadZIP}
-                    className="text-xs font-bold text-emerald-700 hover:text-emerald-950 flex items-center gap-1 cursor-pointer underline"
-                  >
-                    Get Inside ZIP <ExternalLink className="w-3 h-3" />
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <a
+                      href={`/api/jobs/${job.jobId}/download-csv`}
+                      download="product_data.csv"
+                      className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Download CSV
+                    </a>
+                    <button
+                      type="button"
+                      onClick={handleDownloadZIP}
+                      className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      Get Inside ZIP <ExternalLink className="w-3 h-3" />
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1296,6 +1532,8 @@ export default function App() {
                 {job.products.map((product) => {
                   const isExpanded = !!expandedProducts[product.id];
                   const downloadedImagesCount = product.images.filter(i => i.downloadStatus === "Downloaded").length;
+                  const storeName = product.storeName || job.storeName || "Store";
+                  const folderTitle = `${storeName} - ${product.name}`;
 
                   return (
                     <div key={product.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
@@ -1305,14 +1543,19 @@ export default function App() {
                         onClick={() => toggleProduct(product.id)}
                         className="p-4 sm:p-5 flex items-center justify-between gap-4 cursor-pointer hover:bg-slate-50 transition-colors select-none"
                       >
-                        <div className="flex items-start gap-3">
+                        <div className="flex items-start gap-3 min-w-0">
                           <div className="w-10 h-10 rounded-lg bg-slate-100 flex items-center justify-center text-slate-500 shrink-0 border border-slate-200">
                             <Folder className="w-5.5 h-5.5 fill-slate-400 stroke-slate-500" />
                           </div>
                           <div className="min-w-0">
-                            <h4 className="font-bold text-sm text-slate-900 truncate">
-                              {product.name}
-                            </h4>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h4 className="font-bold text-sm text-slate-900 truncate" title={folderTitle}>
+                                {folderTitle}
+                              </h4>
+                              <span className="px-2 py-0.5 text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200/80 rounded-md shrink-0">
+                                {getPOSDisplayName(product.platform || job.detectedPlatform, product.url || job.url)}
+                              </span>
+                            </div>
                             <div className="flex items-center gap-3.5 mt-1 text-[11px] text-slate-500 font-medium">
                               <span className="flex items-center gap-1">
                                 <ImageIcon className="w-3.5 h-3.5 text-slate-400" />
@@ -1342,7 +1585,7 @@ export default function App() {
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleDownloadZIP();
+                              handleDownloadProductFolder(product.id);
                             }}
                             className="px-3 py-1.5 bg-slate-100 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 text-slate-700 hover:text-indigo-700 font-bold text-[11px] rounded-lg transition-colors flex items-center gap-1"
                           >

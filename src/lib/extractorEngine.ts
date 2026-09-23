@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
-import { validatePublicUrl, SECURE_FETCH_HEADERS } from "./security";
-import { detectPlatform, SupportedPlatform } from "./platforms";
+import { validatePublicUrl, SECURE_FETCH_HEADERS } from "./security.ts";
+import { detectPlatform, SupportedPlatform } from "./platforms.ts";
 
 export interface CandidateImage {
   id: string;
@@ -15,6 +15,7 @@ export interface CandidateImage {
 export interface ExtractedProduct {
   id: string;
   name: string;
+  storeName?: string;
   url: string;
   platform: SupportedPlatform;
   confidence: number;
@@ -146,10 +147,11 @@ export function getLargestFromSrcset(srcset: string, baseUrl: string): string | 
   return largestUrl;
 }
 
-// 5. Detect Shopify product URLs and format {origin}/products/{handle}.js
+// 5. Detect Shopify product URLs and format {origin}/products/{handle}.js and .json
 export function parseShopifyProductUrl(rawUrl: string): {
   isShopifyProduct: boolean;
   jsonUrl: string | null;
+  jsonAltUrl: string | null;
   origin: string | null;
   handle: string | null;
 } {
@@ -158,18 +160,20 @@ export function parseShopifyProductUrl(rawUrl: string): {
     const pathname = parsed.pathname;
     const match = pathname.match(/\/products\/([^\/\?#]+)/);
     if (match && match[1]) {
-      const handle = match[1].replace(/\.js$/, "");
+      const handle = match[1].replace(/\.(js|json)$/, "");
       return {
         isShopifyProduct: true,
         origin: parsed.origin,
         handle,
-        jsonUrl: `${parsed.origin}/products/${handle}.js`
+        jsonUrl: `${parsed.origin}/products/${handle}.js`,
+        jsonAltUrl: `${parsed.origin}/products/${handle}.json`
       };
     }
   } catch {}
   return {
     isShopifyProduct: false,
     jsonUrl: null,
+    jsonAltUrl: null,
     origin: null,
     handle: null
   };
@@ -177,6 +181,244 @@ export function parseShopifyProductUrl(rawUrl: string): {
 
 export function sanitizeFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "").trim();
+}
+
+export function cleanStoreNameString(raw: string): string {
+  if (!raw || typeof raw !== "string") return "";
+  let s = raw.trim();
+
+  // If text contains a copyright statement, extract the store name after the year
+  const copyrightMatch = s.match(/(?:©|\bcopyright\b|&copy;|\(c\))\s*(?:\d{4}(?:\s*[-–]\s*\d{4})?)?\s*,?\s*([^.,\n\r|•–—<>{}\[\]]+)/i);
+  if (copyrightMatch && copyrightMatch[1]) {
+    s = copyrightMatch[1].trim();
+  }
+
+  // Strip common footer boilerplate
+  s = s.replace(/report\s*abuse.*$/i, "");
+  s = s.replace(/\breport\s*abuse\b/gi, "");
+  s = s.replace(/powered\s*by.*$/i, "");
+  s = s.replace(/all\s*rights\s*reserved.*$/i, "");
+  s = s.replace(/(?:©|\bcopyright\b|&copy;|\(c\))\s*(?:\d{4}(?:\s*[-–]\s*\d{4})?)?/gi, "");
+  s = s.replace(/\b(Inc|LLC|Ltd|Corp|Co)\.?\b/gi, "");
+  s = s.replace(/[|•–—].*$/, "");
+  s = s.replace(/^[,.\s\-–—:|]+|[,.\s\-–—:|]+$/g, "");
+  return s.trim();
+}
+
+const FORBIDDEN_STORE_WORDS = new Set([
+  "categories", "category", "support", "customer support", "customer service",
+  "information", "info", "quick links", "links", "explore", "company", "about us",
+  "about", "follow us", "shop all", "contact us", "contact", "help", "faqs", "faq",
+  "legal", "resources", "newsletter", "stay in touch", "sign up", "connect",
+  "account", "my account", "orders", "navigation", "nav", "pages", "collections",
+  "collection", "featured", "policies", "policy", "terms", "terms of service",
+  "privacy", "privacy policy", "accessibility", "shipping", "returns", "size guide",
+  "track order", "store locator", "locations", "gift cards", "rewards", "our story",
+  "careers", "blog", "press", "affiliates", "sitemap", "search", "menu", "cart",
+  "bag", "checkout", "home", "shop", "products", "product", "catalog", "services",
+  "overview", "view all", "details", "description", "reviews", "ratings", "share",
+  "subscribe", "footer", "header", "main", "sidebar", "filter", "sort by", "price",
+  "brand", "brands", "vendor", "vendors", "size", "sizes", "color", "colors",
+  "shopify", "woocommerce", "squarespace", "wix", "wordpress", "lightspeed", "ecwid",
+  "magento", "bigcommerce", "weebly", "square", "clover", "toast", "report abuse",
+  "all rights reserved", "powered by", "untitled", "null", "undefined", "image", "photo",
+  "item", "items", "loading", "close", "open", "back", "next", "previous"
+]);
+
+export function isValidStoreName(candidate: string): boolean {
+  if (!candidate || typeof candidate !== "string") return false;
+  const cleaned = cleanStoreNameString(candidate);
+  if (cleaned.length < 2 || cleaned.length > 60) return false;
+  if (/^\d+$/.test(cleaned)) return false;
+  
+  // Reject CSS / code artifacts: oklch, rgb, hsl, var(, ;, {, }, :, @media, px, rem, #, --, \
+  if (/oklch|rgba?|hsla?|var\(|[;{}:@\\]|--|\bpx\b|\brem\b|calc\(|!important/i.test(cleaned)) return false;
+  
+  // Reject if it starts or ends with weird punctuation
+  if (/^[-_=+*/.,;:)\]}>#@!%&|]/.test(cleaned)) return false;
+  
+  // Reject generic platform names or navigation / category column titles
+  const lower = cleaned.toLowerCase();
+  if (FORBIDDEN_STORE_WORDS.has(lower)) return false;
+  if (/^(powered by|report abuse|all rights reserved|designed by|built with|theme by)/i.test(cleaned)) return false;
+  
+  // Must have at least one letter
+  if (!/[a-zA-Z]/.test(cleaned)) return false;
+  return true;
+}
+
+export function extractStoreName(
+  $: cheerio.CheerioAPI | null,
+  url: string,
+  rawHtml?: string
+): string {
+  // Always work with a clean Cheerio DOM where scripts, styles, etc. are stripped
+  let $clean: cheerio.CheerioAPI | null = null;
+  if ($) {
+    try {
+      $clean = cheerio.load($.html());
+      $clean("script, style, noscript, svg, template, iframe, link, a[href*='abuse'], a[href*='report'], [class*='abuse'], [class*='report']").remove();
+    } catch {
+      $clean = $;
+    }
+  } else if (rawHtml) {
+    try {
+      $clean = cheerio.load(rawHtml);
+      $clean("script, style, noscript, svg, template, iframe, link, a[href*='abuse'], a[href*='report'], [class*='abuse'], [class*='report']").remove();
+    } catch {}
+  }
+
+  // 1. High Confidence: OpenGraph site_name & Meta Brand Tags (e.g. Beyond Yoga, Cove San Clemente)
+  if ($) {
+    const ogSiteName = cleanStoreNameString($('meta[property="og:site_name"]').attr("content") || $('meta[name="og:site_name"]').attr("content") || "");
+    if (ogSiteName && isValidStoreName(ogSiteName)) {
+      return sanitizeFilename(ogSiteName);
+    }
+
+    const appName = cleanStoreNameString($('meta[name="application-name"]').attr("content") || $('meta[name="apple-mobile-web-app-title"]').attr("content") || "");
+    if (appName && isValidStoreName(appName)) {
+      return sanitizeFilename(appName);
+    }
+
+    const ogBrand = cleanStoreNameString($('meta[property="og:brand"]').attr("content") || $('meta[name="author"]').attr("content") || "");
+    if (ogBrand && isValidStoreName(ogBrand)) {
+      return sanitizeFilename(ogBrand);
+    }
+  }
+
+  // 2. High Confidence: Schema.org JSON-LD Structured Data
+  if ($) {
+    try {
+      let ldStoreName = "";
+      $('script[type="application/ld+json"]').each((_, el) => {
+        const text = $(el).html()?.trim();
+        if (!text) return;
+        try {
+          const parsed = JSON.parse(text);
+          const items = Array.isArray(parsed) ? parsed : [parsed];
+          for (const item of items) {
+            if (item["@type"] === "Organization" || item["@type"] === "Store" || item["@type"] === "LocalBusiness" || item["@type"] === "WebSite" || item["@type"] === "Brand") {
+              const nameCand = cleanStoreNameString(item.name || item.legalName || "");
+              if (nameCand && isValidStoreName(nameCand)) {
+                ldStoreName = nameCand;
+                return false;
+              }
+            }
+            if (item["@type"] === "Product" && item.brand) {
+              const bName = cleanStoreNameString(typeof item.brand === "string" ? item.brand : item.brand?.name || "");
+              if (bName && isValidStoreName(bName)) {
+                ldStoreName = bName;
+              }
+            }
+          }
+        } catch {}
+      });
+      if (ldStoreName && isValidStoreName(ldStoreName)) return sanitizeFilename(ldStoreName);
+    } catch {}
+  }
+
+  // 3. Footer Copyright & Legal Bottom Bar (e.g. "© 2026 Cove San Clemente", "© 2026 Beyond Yoga")
+  if ($clean) {
+    try {
+      const copyrightSelectors = [
+        'footer [class*="copyright"]',
+        'footer [class*="footer-bottom"]',
+        'footer [class*="site-footer__copyright"]',
+        'footer [class*="footer__copyright"]',
+        'footer [class*="bottom-bar"]',
+        'footer [class*="legal"]',
+        '[class*="footer-copyright"]',
+        '[class*="copyright"]',
+        'small[class*="copyright"]',
+        'p[class*="copyright"]',
+        'footer small',
+        'footer p'
+      ];
+
+      for (const sel of copyrightSelectors) {
+        const els = $clean(sel);
+        for (let i = 0; i < els.length; i++) {
+          const elText = $clean(els[i]).text().trim();
+          if (/©|copyright|&copy;|\(c\)/i.test(elText)) {
+            const parsedName = cleanStoreNameString(elText);
+            if (isValidStoreName(parsedName)) {
+              return sanitizeFilename(parsedName);
+            }
+          }
+        }
+      }
+
+      // Check footer links pointing to homepage or branded links
+      const footerBrandLinks = $clean('footer a[href="/"], footer [class*="copyright"] a, footer [class*="brand"] a, footer [class*="logo"] a');
+      for (let i = 0; i < footerBrandLinks.length; i++) {
+        const linkText = cleanStoreNameString($clean(footerBrandLinks[i]).text());
+        if (isValidStoreName(linkText)) {
+          return sanitizeFilename(linkText);
+        }
+      }
+    } catch {}
+  }
+
+  // 4. Header Brand Logo / Title / Alt Text
+  if ($clean) {
+    try {
+      const headerTextEl = $clean('header .header__heading-link, header .site-header__logo-link, header [class*="logo-text"], header h1 a, header a.logo, header .site-title, header .brand, .navbar-brand').first();
+      const headerText = cleanStoreNameString(headerTextEl.text());
+      if (isValidStoreName(headerText)) {
+        return sanitizeFilename(headerText);
+      }
+
+      if ($) {
+        const headerLogoImg = $('header img[alt], .site-header img[alt], .header__heading-logo img[alt], [class*="header"] [class*="logo"] img[alt], a[href="/"] img[alt]').first();
+        const logoAlt = cleanStoreNameString(headerLogoImg.attr("alt") || "");
+        if (logoAlt && isValidStoreName(logoAlt) && !/^(logo|icon|image|photo|graphic|store logo|site logo)$/i.test(logoAlt)) {
+          return sanitizeFilename(logoAlt);
+        }
+      }
+    } catch {}
+  }
+
+  // 5. Page <title> Delimiter Parsing (e.g. "MISA CASEY DRESS – Cove San Clemente", "Spacedye Legging | Beyond Yoga")
+  if ($) {
+    try {
+      const fullTitle = $("title").text().trim();
+      if (fullTitle) {
+        const delims = [" – ", " — ", " | ", " • ", " - "];
+        for (const delim of delims) {
+          if (fullTitle.includes(delim)) {
+            const parts = fullTitle.split(delim);
+            const lastPart = cleanStoreNameString(parts[parts.length - 1]);
+            if (isValidStoreName(lastPart) && !/^(page\s*\d+|official site|shop|products?|home|online boutique|boutique|store)$/i.test(lastPart)) {
+              return sanitizeFilename(lastPart);
+            }
+            const firstPart = cleanStoreNameString(parts[0]);
+            if (isValidStoreName(firstPart) && parts.length > 1 && /^(welcome to|home of)/i.test(firstPart)) {
+              return sanitizeFilename(firstPart.replace(/^(welcome to|home of)\s*/i, ""));
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 6. Domain / Hostname fallback formatted as Title Case
+  try {
+    const parsed = new URL(normalizeProtocol(url));
+    let host = parsed.hostname.replace(/^www\./i, "");
+    host = host.replace(/\.myshopify\.com$/i, "");
+    host = host.replace(/\.square\.site$/i, "");
+    host = host.replace(/\.company\.site$/i, "");
+    host = host.replace(/\.shoplightspeed\.com$/i, "");
+    host = host.replace(/\.webshopapp\.com$/i, "");
+    host = host.replace(/\.com(\.[a-z]{2})?$|\.org$|\.net$|\.co(\.[a-z]{2})?$|\.io$|\.store$|\.shop$/i, "");
+    const parts = host.split(".").filter(Boolean);
+    const mainName = parts.length > 1 && parts[0] === "shop" ? parts[1] : parts[0];
+    const formatted = mainName.replace(/[-_]+/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").trim();
+    const result = formatted.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+    if (isValidStoreName(result)) return result;
+  } catch {}
+
+  return "Store";
 }
 
 function getCanonicalUrlKey(url: string): string {
@@ -238,9 +480,13 @@ export function isNonProductGraphic(url: string, contextText = ""): boolean {
 // 6. Extract product images from the Shopify JSON response
 export function extractShopifyImages(
   shopifyData: any,
-  originalPageUrl: string
+  originalPageUrl: string,
+  storeNameOverride?: string
 ): ExtractedProduct {
+  const storeName = storeNameOverride || extractStoreName(null, originalPageUrl);
+  const cleanStore = sanitizeFilename(storeName || "Store");
   const title = shopifyData.title || "Product";
+  const cleanProd = sanitizeFilename(title);
   const candidates: CandidateImage[] = [];
   const seenCanonicalUrls = new Set<string>();
   const variantsList: string[] = [];
@@ -261,9 +507,8 @@ export function extractShopifyImages(
     seenCanonicalUrls.add(key);
 
     const index = candidates.length + 1;
-    const cleanProd = sanitizeFilename(title);
-    const cleanVar = variantName && variantName !== "General" ? ` - ${sanitizeFilename(variantName)}` : "";
-    const filename = `${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
+    const cleanVar = variantName && variantName !== "General" && variantName !== "Default" ? ` - ${sanitizeFilename(variantName)}` : "";
+    const filename = `${cleanStore} - ${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
 
     candidates.push({
       id: `img-shopify-${index}`,
@@ -317,6 +562,7 @@ export function extractShopifyImages(
   return {
     id: `prod-shopify-${Date.now()}`,
     name: title,
+    storeName,
     url: originalPageUrl,
     platform: "Shopify",
     confidence: 0.98,
@@ -331,6 +577,8 @@ export function extractWooCommerceImages(
   baseUrl: string,
   html: string
 ): ExtractedProduct {
+  const storeName = extractStoreName($, baseUrl);
+  const cleanStore = sanitizeFilename(storeName || "Store");
   let title =
     $('h1.product_title, .woocommerce-products-header__title').first().text().trim() ||
     $('meta[property="og:title"]').attr("content") ||
@@ -339,6 +587,7 @@ export function extractWooCommerceImages(
 
   if (title.includes("|")) title = title.split("|")[0].trim();
   if (title.includes(" - ")) title = title.split(" - ")[0].trim();
+  const cleanProd = sanitizeFilename(title);
 
   const candidates: CandidateImage[] = [];
   const seenCanonicalUrls = new Set<string>();
@@ -362,9 +611,8 @@ export function extractWooCommerceImages(
       seenCanonicalUrls.add(key);
 
       const index = candidates.length + 1;
-      const cleanProd = sanitizeFilename(title);
-      const cleanVar = variantName && variantName !== "General" ? ` - ${sanitizeFilename(variantName)}` : "";
-      const filename = `${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
+      const cleanVar = variantName && variantName !== "General" && variantName !== "Default" ? ` - ${sanitizeFilename(variantName)}` : "";
+      const filename = `${cleanStore} - ${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
 
       candidates.push({
         id: `img-woo-${index}`,
@@ -491,6 +739,7 @@ export function extractWooCommerceImages(
   return {
     id: `prod-woo-${Date.now()}`,
     name: title,
+    storeName,
     url: baseUrl,
     platform: "WooCommerce",
     confidence: 0.95,
@@ -506,6 +755,8 @@ export function extractGenericPlatformImages(
   platform: SupportedPlatform,
   confidence: number
 ): ExtractedProduct {
+  const storeName = extractStoreName($, baseUrl);
+  const cleanStore = sanitizeFilename(storeName || "Store");
   let title =
     $('meta[property="og:title"]').attr("content") ||
     $('meta[name="twitter:title"]').attr("content") ||
@@ -515,6 +766,7 @@ export function extractGenericPlatformImages(
 
   if (title.includes("|")) title = title.split("|")[0].trim();
   if (title.includes(" - ")) title = title.split(" - ")[0].trim();
+  const cleanProd = sanitizeFilename(title);
 
   const candidates: CandidateImage[] = [];
   const seenCanonicalUrls = new Set<string>();
@@ -551,9 +803,8 @@ export function extractGenericPlatformImages(
       seenCanonicalUrls.add(key);
 
       const index = candidates.length + 1;
-      const cleanProd = sanitizeFilename(title);
-      const cleanVar = variantName && variantName !== "General" ? ` - ${sanitizeFilename(variantName)}` : "";
-      const filename = `${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
+      const cleanVar = variantName && variantName !== "General" && variantName !== "Default" ? ` - ${sanitizeFilename(variantName)}` : "";
+      const filename = `${cleanStore} - ${cleanProd}${cleanVar} - ${String(index).padStart(2, "0")}.jpg`;
 
       candidates.push({
         id: `img-${index}`,
@@ -588,6 +839,64 @@ export function extractGenericPlatformImages(
         }
       }
     } catch {}
+  });
+
+  // 1b. Embedded JSON script elements (ProductJson, __NEXT_DATA__, data-product-json)
+  $('script').each((_, el) => {
+    const text = $(el).html()?.trim();
+    if (!text) return;
+
+    const typeAttr = ($(el).attr("type") || "").toLowerCase();
+    const idAttr = ($(el).attr("id") || "").toLowerCase();
+
+    if (typeAttr.includes("json") || idAttr.includes("product") || idAttr.includes("next")) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed) {
+          const stack = [parsed];
+          let depth = 0;
+          while (stack.length > 0 && depth < 50) {
+            const curr = stack.pop();
+            depth++;
+            if (!curr || typeof curr !== "object") continue;
+
+            if (curr.images && Array.isArray(curr.images)) {
+              for (const img of curr.images) {
+                const u = typeof img === "string" ? img : img?.src || img?.url;
+                addCandidate(u, "General", "Gallery");
+              }
+            }
+            if (curr.featured_image) {
+              const u = typeof curr.featured_image === "string" ? curr.featured_image : curr.featured_image?.src || curr.featured_image?.url;
+              addCandidate(u, "Default", "Main");
+            }
+            if (Array.isArray(curr.variants)) {
+              for (const v of curr.variants) {
+                const vTitle = v.title && v.title !== "Default Title" ? String(v.title) : "Variant";
+                if (vTitle && !variantsList.includes(vTitle) && vTitle !== "Variant") variantsList.push(vTitle);
+                const vImg = v.featured_image ? (typeof v.featured_image === "string" ? v.featured_image : v.featured_image?.src) : (v.image ? (typeof v.image === "string" ? v.image : v.image?.src) : null);
+                if (vImg) addCandidate(vImg, vTitle, "Variant");
+              }
+            }
+
+            for (const key of Object.keys(curr)) {
+              if (["product", "pageProps", "props", "initialState", "data", "store"].includes(key) && curr[key] && typeof curr[key] === "object") {
+                stack.push(curr[key]);
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (text.includes("cdn.shopify.com") || text.includes("paige.com")) {
+      const matches = text.match(/https?:\/\/(?:cdn\.shopify\.com|paige\.com)\/s\/files\/[^\s"'\\,<>]+\.(?:jpg|jpeg|png|webp)/gi);
+      if (matches) {
+        for (const m of matches) {
+          addCandidate(m, "General", "Gallery");
+        }
+      }
+    }
   });
 
   // 2. OpenGraph and Twitter Meta Tags
@@ -644,6 +953,7 @@ export function extractGenericPlatformImages(
   return {
     id: `prod-${Date.now()}`,
     name: title,
+    storeName,
     url: baseUrl,
     platform,
     confidence,
@@ -728,6 +1038,50 @@ export function discoverProductLinks(
   return discovered;
 }
 
+// Direct HTML parser function for pasted source code or client-side fetch payloads
+export function extractProductFromHtml(html: string, targetUrl: string): ExtractedProduct {
+  const cleanUrl = normalizeProtocol(targetUrl || "https://store.com");
+  const $ = cheerio.load(html);
+  const detection = detectPlatform(cleanUrl, html, $);
+  let product: ExtractedProduct;
+  if (detection.platform === "WooCommerce") {
+    product = extractWooCommerceImages($, cleanUrl, html);
+  } else {
+    product = extractGenericPlatformImages($, cleanUrl, detection.platform, detection.confidence);
+  }
+  return product;
+}
+
+// Helper: Fetch archived snapshot when direct requests hit Vercel / Cloudflare WAF Security Checkpoints (429/403)
+async function fetchWaybackSnapshotProduct(cleanUrl: string): Promise<ExtractedProduct | null> {
+  try {
+    const wbApiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(cleanUrl)}`;
+    const res = await fetch(wbApiUrl, { headers: SECURE_FETCH_HEADERS });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const snapshotUrl = json?.archived_snapshots?.closest?.url;
+    if (!snapshotUrl) return null;
+
+    const snapRes = await fetch(snapshotUrl, { headers: SECURE_FETCH_HEADERS });
+    if (!snapRes.ok) return null;
+    const html = await snapRes.text();
+    const $ = cheerio.load(html);
+
+    const detection = detectPlatform(cleanUrl, html, $);
+    let product: ExtractedProduct;
+    if (detection.platform === "WooCommerce") {
+      product = extractWooCommerceImages($, cleanUrl, html);
+    } else {
+      product = extractGenericPlatformImages($, cleanUrl, detection.platform, detection.confidence);
+    }
+
+    if (product && product.images.length > 0) {
+      return product;
+    }
+  } catch {}
+  return null;
+}
+
 // 10. Extract a single product with full platform detection and fallback
 export async function extractProductFromUrl(targetUrl: string): Promise<{
   success: boolean;
@@ -753,31 +1107,47 @@ export async function extractProductFromUrl(targetUrl: string): Promise<{
     // 1. Check if Shopify product URL
     const shopifyInfo = parseShopifyProductUrl(cleanUrl);
     if (shopifyInfo.isShopifyProduct && shopifyInfo.jsonUrl) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 6000);
-        const shopifyRes = await fetch(shopifyInfo.jsonUrl, {
-          headers: SECURE_FETCH_HEADERS,
-          signal: controller.signal
-        });
-        clearTimeout(timer);
+      const jsonEndpoints = [shopifyInfo.jsonUrl, shopifyInfo.jsonAltUrl].filter(Boolean) as string[];
+      for (const endpoint of jsonEndpoints) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 6000);
+          const shopifyRes = await fetch(endpoint, {
+            headers: SECURE_FETCH_HEADERS,
+            signal: controller.signal
+          });
+          clearTimeout(timer);
 
-        if (shopifyRes.ok) {
-          const contentType = shopifyRes.headers.get("content-type") || "";
-          if (contentType.includes("json") || contentType.includes("javascript")) {
-            const data = await shopifyRes.json();
-            if (data && (data.title || data.images || data.featured_image)) {
-              const product = extractShopifyImages(data, cleanUrl);
-              return {
-                success: true,
-                product,
-                platform: "Shopify",
-                confidence: 0.98
-              };
+          if (shopifyRes.ok) {
+            const contentType = shopifyRes.headers.get("content-type") || "";
+            if (contentType.includes("json") || contentType.includes("javascript")) {
+              const rawData = await shopifyRes.json();
+              const data = rawData.product || rawData;
+              if (data && (data.title || data.images || data.featured_image)) {
+                let storeName: string | undefined;
+                try {
+                  const pageRes = await fetch(cleanUrl, { headers: SECURE_FETCH_HEADERS });
+                  if (pageRes.ok) {
+                    const pageHtml = await pageRes.text();
+                    const $page = cheerio.load(pageHtml);
+                    storeName = extractStoreName($page, cleanUrl, pageHtml);
+                  }
+                } catch (_) {}
+
+                const product = extractShopifyImages(data, cleanUrl, storeName);
+                if (product.images.length > 0) {
+                  return {
+                    success: true,
+                    product,
+                    platform: "Shopify",
+                    confidence: 0.98
+                  };
+                }
+              }
             }
           }
-        }
-      } catch {}
+        } catch {}
+      }
     }
 
     // 2. Server-side fetch HTML with AbortController timeout
@@ -789,15 +1159,37 @@ export async function extractProductFromUrl(targetUrl: string): Promise<{
     });
     clearTimeout(timer);
 
-    if (!htmlRes.ok) {
+    let html = "";
+    let isWafBlocked = false;
+
+    if (!htmlRes.ok || htmlRes.status === 429 || htmlRes.status === 403 || htmlRes.status === 503) {
+      isWafBlocked = true;
+    } else {
+      html = await htmlRes.text();
+      if (html.includes("Vercel Security Checkpoint") || html.includes("Cloudflare") && html.includes("Attention Required") || html.includes("Just a moment...")) {
+        isWafBlocked = true;
+      }
+    }
+
+    // If direct server fetch was blocked by Vercel/Cloudflare Security Checkpoint (429/403/503)
+    if (isWafBlocked) {
+      const waybackProduct = await fetchWaybackSnapshotProduct(cleanUrl);
+      if (waybackProduct && waybackProduct.images.length > 0) {
+        return {
+          success: true,
+          product: waybackProduct,
+          platform: waybackProduct.images[0]?.filename?.includes("shopify") ? "Shopify" : "Custom E-Commerce",
+          confidence: 0.95
+        };
+      }
+
       return {
         success: false,
-        error: `Target server responded with HTTP ${htmlRes.status}`,
-        statusCode: htmlRes.status >= 400 && htmlRes.status < 500 ? htmlRes.status : 502
+        error: `Target store (${new URL(cleanUrl).hostname}) is protected by Vercel/Cloudflare Security Checkpoint. Please paste the page HTML or use HTML Import below.`,
+        statusCode: 429
       };
     }
 
-    const html = await htmlRes.text();
     const $ = cheerio.load(html);
 
     // 3. Platform Detection
@@ -811,6 +1203,17 @@ export async function extractProductFromUrl(targetUrl: string): Promise<{
     }
 
     if (product.images.length === 0) {
+      // Fallback attempt via archive snapshot if initial cheerio parse found 0 images
+      const waybackProduct = await fetchWaybackSnapshotProduct(cleanUrl);
+      if (waybackProduct && waybackProduct.images.length > 0) {
+        return {
+          success: true,
+          product: waybackProduct,
+          platform: detection.platform,
+          confidence: 0.90
+        };
+      }
+
       return {
         success: false,
         platform: detection.platform,
@@ -828,6 +1231,20 @@ export async function extractProductFromUrl(targetUrl: string): Promise<{
     };
   } catch (err: any) {
     const isTimeout = err.name === "AbortError" || err.message?.includes("aborted");
+
+    // Attempt Wayback fallback on timeout / connection error
+    try {
+      const waybackProduct = await fetchWaybackSnapshotProduct(cleanUrl);
+      if (waybackProduct && waybackProduct.images.length > 0) {
+        return {
+          success: true,
+          product: waybackProduct,
+          platform: "Custom E-Commerce",
+          confidence: 0.90
+        };
+      }
+    } catch {}
+
     return {
       success: false,
       error: isTimeout

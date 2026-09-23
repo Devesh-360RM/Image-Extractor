@@ -11,8 +11,11 @@ import {
   getShopifyHighResImageUrl,
   parseShopifyProductUrl,
   extractShopifyImages,
-  extractProductFromUrl
+  extractProductFromUrl,
+  extractProductFromHtml,
+  extractStoreName
 } from "./src/lib/extractorEngine";
+import { SECURE_FETCH_HEADERS } from "./src/lib/security";
 import { detectPlatform } from "./src/lib/platforms";
 
 const app = express();
@@ -397,7 +400,7 @@ app.post("/api/parse-file", upload.single("file"), (req: any, res: any) => {
 
 // API: Create extraction job
 app.post("/api/extract", async (req, res) => {
-  const { url, urls, mode = "auto", options = {} } = req.body;
+  const { url, urls, fileName, mode = "auto", options = {} } = req.body;
 
   if (!url && (!urls || !Array.isArray(urls) || urls.length === 0)) {
     return res.status(400).json({ error: "URL or a list of URLs is required" });
@@ -408,6 +411,7 @@ app.post("/api/extract", async (req, res) => {
     jobId,
     url: url || `Bulk Scrape: ${urls.length} links`,
     urls: urls || undefined,
+    fileName: fileName || undefined,
     mode,
     status: "analyzing",
     options: {
@@ -467,6 +471,92 @@ app.post("/api/extract", async (req, res) => {
 
     return res.json({ jobId });
   }
+});
+
+// API: Extract product directly from pasted HTML or client-fetched HTML
+app.post("/api/extract-html", async (req, res) => {
+  const { html, url = "https://paige.com/products/men-lennox-emberton-1" } = req.body;
+
+  if (!html || typeof html !== "string" || html.trim().length === 0) {
+    return res.status(400).json({ error: "Page HTML content is required" });
+  }
+
+  const jobId = `job-${Date.now()}`;
+  const extracted = extractProductFromHtml(html, url);
+
+  if (!extracted || extracted.images.length === 0) {
+    return res.status(422).json({ error: "No product images found in the provided HTML." });
+  }
+
+  const images: ImageMetadata[] = extracted.images.map((img, idx) => ({
+    id: `img-${idx + 1}`,
+    filename: img.filename || `image-${idx + 1}.jpg`,
+    originalUrl: img.originalUrl,
+    resolution: img.resolution || "Original Quality",
+    size: "HD Asset",
+    variant: img.variant || "General",
+    type: img.type || "Gallery",
+    contentType: "image/jpeg",
+    downloadStatus: "Downloaded" as const
+  }));
+
+  const productData: ProductData = {
+    id: `prod-1`,
+    name: extracted.name,
+    storeName: extracted.storeName,
+    url,
+    images,
+    variants: extracted.variants || []
+  };
+
+  const job: ExtractionJob = {
+    jobId,
+    url,
+    mode: "product",
+    status: "completed",
+    options: {
+      includeGallery: true,
+      includeVariants: true,
+      useHighestResolution: true,
+      removeDuplicates: true,
+      includeStyleSiblings: false
+    },
+    progress: {
+      currentStep: "Extraction complete!",
+      productsFound: 1,
+      currentProductIndex: 1,
+      currentProductName: extracted.name,
+      imagesFound: images.length,
+      imagesDownloaded: images.length,
+      imagesFailed: 0,
+      duplicatesRemoved: 0,
+      percent: 100
+    },
+    products: [productData],
+    failedDownloads: []
+  };
+
+  saveJob(jobId, job);
+
+  // Background download image buffers
+  for (const img of images) {
+    try {
+      const imgRes = await fetch(img.originalUrl, { headers: SECURE_FETCH_HEADERS });
+      if (imgRes.ok) {
+        const arrayBuf = await imgRes.arrayBuffer();
+        const buf = Buffer.from(arrayBuf);
+        saveImageBuffer(`${jobId}-${productData.id}-${img.id}`, buf);
+        img.downloadStatus = "Downloaded";
+      } else {
+        img.downloadStatus = "Failed";
+      }
+    } catch {
+      img.downloadStatus = "Failed";
+    }
+  }
+
+  saveJob(jobId, job);
+  return res.json({ jobId, job });
 });
 
 // API: Get extraction job status
@@ -535,6 +625,100 @@ app.get("/api/jobs/:jobId/download-image/:productId/:imageId", (req, res) => {
   res.send(buffer);
 });
 
+// API: Generate and Download ZIP for a specific product folder
+app.get("/api/jobs/:jobId/products/:productId/download-zip", async (req, res) => {
+  const { jobId, productId } = req.params;
+  const job = getJob(jobId);
+  const product = job?.products.find(p => p.id === productId);
+
+  if (!job || !product) {
+    return res.status(404).json({ error: "Product or Job not found" });
+  }
+
+  try {
+    const zip = new JSZip();
+    const prodStoreName = product.storeName || job.storeName || extractStoreName(null, product.url) || "Store";
+    const cleanStore = sanitizeFilename(prodStoreName);
+    const cleanProd = sanitizeFilename(product.name);
+    const folderName = `${cleanStore} - ${cleanProd}`;
+    const productFolder = zip.folder(folderName);
+    if (!productFolder) throw new Error("Could not create product folder in ZIP");
+
+    let imageNum = 1;
+    let csvContent = `"Product Name","Store Name","Product URL","Variant","Image Type","Image Number","Image File Name","Image URL","Image Resolution","Download Status"\n`;
+
+    for (const img of product.images) {
+      if (img.downloadStatus === "Downloaded") {
+        const bufferKey = `${jobId}_${product.id}_${img.id}`;
+        const buffer = getImageBuffer(bufferKey);
+        if (buffer) {
+          productFolder.file(img.filename, buffer);
+        }
+      }
+
+      const csvRow = [
+        product.name,
+        prodStoreName,
+        product.url,
+        img.variant || "General",
+        img.type,
+        imageNum++,
+        img.filename,
+        img.originalUrl,
+        img.resolution,
+        img.downloadStatus
+      ].map(val => `"${String(val).replace(/"/g, '""')}"`).join(",");
+      csvContent += csvRow + "\n";
+    }
+
+    zip.file("product_data.csv", csvContent);
+
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(folderName)}.zip"`);
+    res.setHeader("Content-Type", "application/zip");
+    res.send(zipBuffer);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to generate product folder ZIP: " + err.message });
+  }
+});
+
+// API: Download product_data.csv directly
+app.get("/api/jobs/:jobId/download-csv", (req, res) => {
+  const { jobId } = req.params;
+  const job = getJob(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  const defaultStoreName = job.storeName || extractStoreName(null, job.url);
+  let csvContent = `"Product Name","Store Name","Product URL","Variant","Image Type","Image Number","Image File Name","Image URL","Image Resolution","Download Status"\n`;
+
+  for (const product of job.products) {
+    const prodStoreName = product.storeName || defaultStoreName;
+    let imageNum = 1;
+    for (const img of product.images) {
+      const csvRow = [
+        product.name,
+        prodStoreName,
+        product.url,
+        img.variant || "General",
+        img.type,
+        imageNum++,
+        img.filename,
+        img.originalUrl,
+        img.resolution,
+        img.downloadStatus
+      ].map(val => `"${String(val).replace(/"/g, '""')}"`).join(",");
+      csvContent += csvRow + "\n";
+    }
+  }
+
+  res.setHeader("Content-Disposition", 'attachment; filename="product_data.csv"');
+  res.setHeader("Content-Type", "text/csv");
+  res.send(csvContent);
+});
+
 // API: Generate and Download ZIP of the entire job
 app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
   const { jobId } = req.params;
@@ -551,17 +735,20 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
   try {
     const zip = new JSZip();
 
-    // Create a folder for the Job
-    const rootFolder = zip.folder("Image Extractor");
-    if (!rootFolder) throw new Error("Could not create ZIP root folder");
-
     // CSV header row
-    let csvContent = `"Product Name","Product URL","Variant","Image Type","Image Number","Image File Name","Image URL","Image Resolution","Download Status"\n`;
+    let csvContent = `"Product Name","Store Name","Product URL","Variant","Image Type","Image Number","Image File Name","Image URL","Image Resolution","Download Status"\n`;
+
+    const firstProd = job.products[0];
+    const defaultStoreName = firstProd?.storeName || job.storeName || extractStoreName(null, job.url);
+    const cleanDefaultStore = sanitizeFilename(defaultStoreName || "Store");
 
     // Process each product
     for (const product of job.products) {
+      const prodStoreName = product.storeName || defaultStoreName;
+      const cleanStore = sanitizeFilename(prodStoreName || "Store");
       const sanitizedProductName = sanitizeFilename(product.name);
-      const productFolder = rootFolder.folder(sanitizedProductName);
+      const folderName = `${cleanStore} - ${sanitizedProductName}`;
+      const productFolder = zip.folder(folderName);
       if (!productFolder) continue;
 
       let imageNum = 1;
@@ -571,23 +758,14 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
           const buffer = getImageBuffer(bufferKey);
 
           if (buffer) {
-            // If color-specific or option variant subfolders are requested
-            if (job.options.includeVariants && img.variant && img.variant !== "General") {
-              const variantFolder = productFolder.folder(sanitizeFilename(img.variant));
-              if (variantFolder) {
-                variantFolder.file(img.filename, buffer);
-              } else {
-                productFolder.file(img.filename, buffer);
-              }
-            } else {
-              productFolder.file(img.filename, buffer);
-            }
+            productFolder.file(img.filename, buffer);
           }
         }
 
         // Add to CSV metadata
         const csvRow = [
           product.name,
+          prodStoreName,
           product.url,
           img.variant || "General",
           img.type,
@@ -602,13 +780,21 @@ app.get("/api/jobs/:jobId/download-zip", async (req, res) => {
     }
 
     // Add product_data.csv
-    rootFolder.file("product_data.csv", csvContent);
+    zip.file("product_data.csv", csvContent);
 
     // Generate zip content
     const zipBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 
-    // Stream download
-    res.setHeader("Content-Disposition", `attachment; filename="Image_Extractor_${sanitizeFilename(job.url.replace(/^https?:\/\//, '').replace(/\//g, '_'))}.zip"`);
+    // Stream download with formatted ZIP name
+    let zipName = `${cleanDefaultStore} - Extracted Products.zip`;
+    if (job.fileName) {
+      const cleanFileBase = sanitizeFilename(job.fileName.replace(/\.[^/.]+$/, "")) || "Extracted Products";
+      zipName = `${cleanFileBase}.zip`;
+    } else if (job.products.length === 1 && firstProd) {
+      zipName = `${cleanDefaultStore} - ${sanitizeFilename(firstProd.name)}.zip`;
+    }
+
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(zipName)}"`);
     res.setHeader("Content-Type", "application/zip");
     res.send(zipBuffer);
   } catch (err: any) {
@@ -648,7 +834,7 @@ async function runCrawler(jobId: string) {
         job.progress.percent = Math.floor(10 + (uIdx / totalUrls) * 85);
         saveJob(jobId, job);
 
-        let platform = "generic";
+        let platform = "Generic";
         let html = "";
         const HEADERS = {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -659,17 +845,9 @@ async function runCrawler(jobId: string) {
           const response = await fetchWithTimeout(currentUrl, { headers: HEADERS }, 4000);
           if (response.ok) {
             html = await response.text();
-            if (html.includes("cdn.shopify.com") || html.includes("window.Shopify")) {
-              platform = "shopify";
-            } else if (html.includes("/wp-content/") || html.includes("woocommerce")) {
-              platform = "woocommerce";
-            } else if (html.includes("magento")) {
-              platform = "magento";
-            } else if (html.includes("bigcommerce")) {
-              platform = "bigcommerce";
-            } else if (html.includes("window.__BOOTSTRAP_STATE__") || html.includes("editmysite.com")) {
-              platform = "weebly";
-            }
+            const $ = cheerio.load(html);
+            const detection = detectPlatform(currentUrl, html, $);
+            platform = detection.platform;
           }
         } catch (fetchErr) {
           console.error(`Error fetching URL for platform detection: ${currentUrl}`, fetchErr);
@@ -858,6 +1036,10 @@ async function runCrawler(jobId: string) {
     const platform = detection.platform;
     job.detectedPlatform = detection.platform;
     job.confidenceScore = detection.confidence;
+
+    // Extract exact store / company name from HTML footer, header, og:site_name, and meta tags
+    const detectedStoreName = extractStoreName($, urlStr, mainHtml);
+    job.storeName = detectedStoreName;
 
     // 3. Determine URL Mode (Product vs Listing)
     let detectedMode: "product" | "collection" = "product";
@@ -1161,6 +1343,7 @@ async function extractAndDownloadProduct(
   };
 
   let productTitle = predefinedName || "";
+  let extractedStoreName = job.storeName || "";
   let imageCandidates: { url: string; variant?: string; type: string }[] = [];
   let variants: string[] = [];
 
@@ -1176,8 +1359,19 @@ async function extractAndDownloadProduct(
         if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
           const data = JSON.parse(text);
           if (data && (data.title || data.images || data.featured_image)) {
-            const extracted = extractShopifyImages(data, productUrl);
+            if (!extractedStoreName) {
+              try {
+                const pageRes = await fetchWithTimeout(productUrl, { headers: HEADERS }, 3500);
+                if (pageRes.ok) {
+                  const pHtml = await pageRes.text();
+                  const $p = cheerio.load(pHtml);
+                  extractedStoreName = extractStoreName($p, productUrl, pHtml);
+                }
+              } catch (_) {}
+            }
+            const extracted = extractShopifyImages(data, productUrl, extractedStoreName);
             productTitle = extracted.name || productTitle;
+            if (extracted.storeName) extractedStoreName = extracted.storeName;
             variants = extracted.variants;
             for (const img of extracted.images) {
               imageCandidates.push({
@@ -1294,11 +1488,36 @@ async function extractAndDownloadProduct(
 
     const $ = cheerio.load(html);
 
+    if (!extractedStoreName) {
+      extractedStoreName = extractStoreName($, productUrl, html);
+    }
+
+    const cleanCandidateTitle = (raw: string): string => {
+      if (!raw) return "";
+      let t = raw.trim();
+      if (/^(shopping cart|cart|checkout|bag|products?|home|search|menu|my account|untitled)$/i.test(t)) return "";
+      // Strip delimiters like " | Store Name" or " - Store Name"
+      const delims = [" | ", " – ", " — ", " • ", " - "];
+      for (const d of delims) {
+        if (t.includes(d)) {
+          const parts = t.split(d);
+          if (extractedStoreName && parts[parts.length - 1].toLowerCase().includes(extractedStoreName.toLowerCase())) {
+            t = parts.slice(0, parts.length - 1).join(d).trim();
+          } else if (parts.length === 2 && parts[1].length < 35 && !parts[0].toLowerCase().includes("cart")) {
+            t = parts[0].trim();
+          }
+        }
+      }
+      return t;
+    };
+
     if (!productTitle) {
-      productTitle = $("h1").first().text().trim() || 
-                     $('meta[property="og:title"]').attr("content")?.trim() || 
-                     $("title").text().trim() || 
-                     "Product";
+      const h1Specific = $('h1.product-title, h1.product__title, h1.page-title, h1[itemprop="name"], [itemprop="name"] h1, h1:not([class*="cart"]):not([class*="bag"])').first().text().trim();
+      const ogTitle = $('meta[property="og:title"]').attr("content")?.trim() || "";
+      const h1First = $("h1").first().text().trim();
+      const docTitle = $("title").text().trim();
+
+      productTitle = cleanCandidateTitle(h1Specific) || cleanCandidateTitle(ogTitle) || cleanCandidateTitle(h1First) || cleanCandidateTitle(docTitle) || "";
     }
 
     // A. Parse application/ld+json for Structured Product Data
@@ -1323,8 +1542,9 @@ async function extractAndDownloadProduct(
 
         const prod = findProductSchema(schema);
         if (prod) {
-          if (prod.name && !productTitle) {
-            productTitle = prod.name;
+          if (prod.name && (!productTitle || /^(shopping cart|cart|product)$/i.test(productTitle))) {
+            const cleaned = cleanCandidateTitle(prod.name);
+            if (cleaned) productTitle = cleaned;
           }
           // Process schema images
           if (prod.image) {
@@ -1484,6 +1704,11 @@ async function extractAndDownloadProduct(
   job.progress.imagesFound += normalizedCandidates.length;
   saveJob(jobId, job);
 
+  if (!extractedStoreName) {
+    extractedStoreName = extractStoreName(null, productUrl);
+  }
+  const cleanStoreName = sanitizeFilename(extractedStoreName || "Store");
+
   // Download candidate images
   let imgIndex = 1;
   for (const cand of normalizedCandidates) {
@@ -1494,13 +1719,13 @@ async function extractAndDownloadProduct(
     const imageId = `img-${Date.now()}-${imgIndex}`;
     const cleanProdName = sanitizeFilename(productTitle);
     
-    // Create elegant filename
-    let variantSuffix = cand.variant ? ` - ${sanitizeFilename(cand.variant)}` : "";
+    // Create elegant filename in {{store Name}} - {{Product Name}} format
+    let variantSuffix = cand.variant && cand.variant !== "General" && cand.variant !== "Default" ? ` - ${sanitizeFilename(cand.variant)}` : "";
     if (variantSuffix.length > 30) variantSuffix = variantSuffix.substring(0, 30); // clip excessively long alt texts
     const extension = path.extname(new URL(cand.url).pathname) || ".jpg";
     const finalExtension = [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(extension.toLowerCase()) ? extension : ".jpg";
     
-    const filename = `${cleanProdName}${variantSuffix} - ${String(imgIndex).padStart(2, '0')}${finalExtension}`;
+    const filename = `${cleanStoreName} - ${cleanProdName}${variantSuffix} - ${String(imgIndex).padStart(2, '0')}${finalExtension}`;
 
     try {
       const response = await fetchWithTimeout(cand.url, { headers: HEADERS }, 3500);
@@ -1566,9 +1791,11 @@ async function extractAndDownloadProduct(
   return {
     id: productDataId,
     name: productTitle,
+    storeName: extractedStoreName,
     url: productUrl,
     images: finalImages,
-    variants: uniqueVariantsList
+    variants: uniqueVariantsList,
+    platform: platform
   };
 }
 
@@ -1576,6 +1803,9 @@ async function extractAndDownloadProduct(
 async function simulateDemoExtraction(job: ExtractionJob) {
   const jobId = job.jobId;
   const isListing = job.mode === "collection" || job.url.includes("collection") || job.url.includes("category");
+
+  job.detectedPlatform = job.detectedPlatform || "Shopify";
+  job.storeName = job.storeName || "Demo Store";
 
   job.progress.currentStep = "Initiating Sandbox Crawler...";
   job.progress.percent = 10;
@@ -1632,6 +1862,7 @@ async function simulateDemoExtraction(job: ExtractionJob) {
     await sleep(800);
 
     const productDataId = `prod-demo-${productIdx}-${Date.now()}`;
+    const demoStoreName = "Demo Store";
     const productImages: ImageMetadata[] = [];
     const uniqueVariants: string[] = [];
 
@@ -1643,9 +1874,10 @@ async function simulateDemoExtraction(job: ExtractionJob) {
 
       const imageId = `img-demo-${productIdx}-${imgIdx}`;
       const extension = ".jpg";
+      const cleanStore = sanitizeFilename(demoStoreName);
       const cleanProdName = sanitizeFilename(dp.name);
       const cleanVariant = sanitizeFilename(imgSpec.variant);
-      const filename = `${cleanProdName} - ${cleanVariant} - ${String(imgIdx).padStart(2, '0')}${extension}`;
+      const filename = `${cleanStore} - ${cleanProdName} - ${cleanVariant} - ${String(imgIdx).padStart(2, '0')}${extension}`;
 
       try {
         // Fetch real buffer from Unsplash to make the download ZIP completely functional and contain real JPEGs!
@@ -1702,9 +1934,11 @@ async function simulateDemoExtraction(job: ExtractionJob) {
     job.products.push({
       id: productDataId,
       name: dp.name,
+      storeName: "Demo Store",
       url: dp.url,
       images: productImages,
-      variants: uniqueVariants
+      variants: uniqueVariants,
+      platform: "Shopify"
     });
 
     productIdx++;

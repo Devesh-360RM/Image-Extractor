@@ -1,25 +1,25 @@
 import * as cheerio from "cheerio";
 
 export type SupportedPlatform =
-  | "Shopify"
-  | "WooCommerce"
-  | "WordPress"
-  | "Square Online"
-  | "Lightspeed eCom"
-  | "Ecwid"
-  | "BigCommerce"
-  | "Wix Stores"
-  | "Squarespace Commerce"
-  | "Magento / Adobe Commerce"
-  | "PrestaShop"
-  | "Shopware"
-  | "Webflow Ecommerce"
-  | "Shift4Shop"
-  | "Clover"
-  | "GoDaddy Online Store"
-  | "Volusion"
-  | "Salesforce Commerce Cloud"
-  | "Custom E-Commerce";
+  | "./shopify.ts"
+  | "./WooCommerce.ts"
+  | "./WordPress.ts"
+  | "./Square Online.ts"
+  | "./Lightspeed eCom.ts"
+  | "./Ecwid.ts"
+  | "./BigCommerce.ts"
+  | "./Wix Stores.ts"
+  | "./Squarespace Commerce.ts"
+  | "./Magento / Adobe Commerce.ts"
+  | "./PrestaShop.ts"
+  | "./Shopware.ts"
+  | "./Webflow Ecommerce.ts"
+  | "./Shift4Shop.ts"
+  | "./Clover.ts"
+  | "./GoDaddy Online Store.ts"
+  | "./Volusion.ts"
+  | "./Salesforce Commerce Cloud.ts"
+  | "./Custom E-Commerce.ts";
 
 export interface DetectionResult {
   platform: SupportedPlatform;
@@ -111,8 +111,11 @@ export function detectPlatform(
     return { platform: "BigCommerce", confidence: 0.95, reasons };
   }
 
-  // 7. Lightspeed eCom (C-Series WebshopApp or E-Series with active Lightspeed branding)
+  // 7. Lightspeed eCom (C-Series WebshopApp or E-Series with active Lightspeed branding or footer)
   if (
+    lowerHtml.includes("powered by lightspeed") ||
+    lowerHtml.includes("shoplightspeed.com") ||
+    lowerHtml.includes("lightspeed") ||
     lowerHtml.includes("cdn.webshopapp.com") ||
     lowerHtml.includes("seoshop") ||
     hostname.includes("shoplightspeed.com") ||
@@ -121,8 +124,8 @@ export function detectPlatform(
     lowerHtml.includes("ec-lightspeed-branding") ||
     $('meta[name="generator"][content*="lightspeed"]').length > 0
   ) {
-    reasons.push("Lightspeed eCom branding, POS integration, or WebshopApp CDN detected");
-    return { platform: "Lightspeed eCom", confidence: 0.95, reasons };
+    reasons.push("Lightspeed eCom / POS branding detected");
+    return { platform: "Lightspeed eCom", confidence: 0.98, reasons };
   }
 
   // 8. Ecwid / company.site

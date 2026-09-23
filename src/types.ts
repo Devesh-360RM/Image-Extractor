@@ -14,6 +14,7 @@ export interface ImageMetadata {
 export interface ProductData {
   id: string;
   name: string;
+  storeName?: string;
   url: string;
   images: ImageMetadata[];
   variants: string[];
@@ -31,6 +32,8 @@ export interface ExtractionJob {
   jobId: string;
   url: string;
   urls?: string[];
+  fileName?: string;
+  storeName?: string;
   mode: 'auto' | 'product' | 'collection';
   status: 'idle' | 'analyzing' | 'extracting' | 'completed' | 'failed' | 'cancelled';
   detectedPlatform?: string;
